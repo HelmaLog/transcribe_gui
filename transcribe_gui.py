@@ -115,6 +115,7 @@ def _parse_translation(content):
                     break
                 else:
                     break
+            text_part = text_part.rstrip("，。！？；：、…·")
             parsed[idx] = (text_part, emoji)
     return parsed
 
