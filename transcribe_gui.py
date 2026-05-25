@@ -126,10 +126,15 @@ def translate_batch(subs_batch, api_key, model, log):
     content = None
     for attempt in range(3):
         try:
+            log("  → 等待 API 响应...")
             with urllib.request.urlopen(req, timeout=120) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
                 content = result["choices"][0]["message"]["content"].strip()
-                break
+            log("  ← 收到响应：")
+            for line in content.splitlines():
+                if line.strip():
+                    log(f"    {line}")
+            break
         except Exception as e:
             log(f"⚠️ 第{attempt+1}次请求失败: {e}，{'重试中...' if attempt < 2 else '跳过本批'}")
             if attempt < 2:
@@ -138,7 +143,6 @@ def translate_batch(subs_batch, api_key, model, log):
     if content is None:
         return {}
 
-    # 解析输出
     parsed = {}
     for line in content.split("\n"):
         line = line.strip()
@@ -148,10 +152,8 @@ def translate_batch(subs_batch, api_key, model, log):
         if m:
             idx = int(m.group(1))
             rest = m.group(2).strip()
-            # 提取表情（第一个字符如果是emoji）
             emoji = ""
             text_part = rest
-            # 检查开头是否有表情符号
             for i, ch in enumerate(rest):
                 if ord(ch) > 127:
                     emoji = ch
@@ -166,12 +168,14 @@ def translate_batch(subs_batch, api_key, model, log):
 
 def run_transcribe(config, log):
     try:
-        from faster_whisper import WhisperModel
         import srt
         from srt_equalizer import srt_equalizer
+        from datetime import date
+        import re as _re
 
-        video_path = config["video_path"]
-        model_path = config["model_path"]
+        video_path = config.get("video_path", "")
+        srt_path = config.get("srt_path", "")
+        model_path = config.get("model_path", "")
         device = config["device"]
         compute_type = config["compute_type"]
         language = config["language"]
@@ -183,89 +187,110 @@ def run_transcribe(config, log):
         translate_model = config["translate_model"]
         batch_size = config["batch_size"]
 
-        log(f"加载模型: {model_path}")
-        model = WhisperModel(model_path, device=device, compute_type=compute_type)
-        log("模型加载完成")
+        use_existing_srt = bool(srt_path and os.path.exists(srt_path))
 
-        log(f"开始转写: {os.path.basename(video_path)}")
-        segments, info = model.transcribe(
-            video_path,
-            language=language if language else None,
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters=dict(
-                threshold=0.5,
-                min_speech_duration_ms=0,
-                max_speech_duration_s=3.0,
-                min_silence_duration_ms=500,
-                speech_pad_ms=400,
-            ),
-            word_timestamps=True,
-            condition_on_previous_text=False,
-            suppress_tokens=[-1],
-            initial_prompt=initial_prompt if initial_prompt.strip() else None,
-        )
-        log(f"检测语言: {info.language}，时长: {info.duration:.1f}s")
-        log("正在识别，请稍候...")
+        if use_existing_srt:
+            # 直接加载已有英文字幕，跳过转写
+            log(f"使用已有英文字幕: {os.path.basename(srt_path)}")
+            with open(srt_path, "r", encoding="utf-8") as f:
+                split_subs = list(srt.parse(f.read()))
+            log(f"已加载 {len(split_subs)} 条字幕")
 
-        subs = []
-        for i, seg in enumerate(segments, 1):
-            subs.append(srt.Subtitle(
-                index=i,
-                start=timedelta(seconds=seg.start),
-                end=timedelta(seconds=seg.end),
-                content=seg.text.strip(),
-            ))
-            if i % 10 == 0:
-                log(f"已识别 {i} 段，进度: {seg.start:.1f}s / {info.duration:.1f}s")
+            srt_stem = os.path.splitext(os.path.basename(srt_path))[0]
+            if srt_stem.endswith("_英文"):
+                srt_stem = srt_stem[:-3]
+            short_name = srt_stem
+            ref_dir = os.path.dirname(os.path.abspath(srt_path))
+        else:
+            from faster_whisper import WhisperModel
 
-        log(f"识别完成，共 {len(subs)} 段，开始切分...")
-        split_subs = []
-        for sub in subs:
-            split_subs.extend(srt_equalizer.split_subtitle(sub, max_chars))
-        for i, sub in enumerate(split_subs, 1):
-            sub.index = i
+            log(f"加载模型: {model_path}")
+            model = WhisperModel(model_path, device=device, compute_type=compute_type)
+            log("模型加载完成")
 
-        # 生成简短文件名：取视频名前8个单词 + 日期
-        from datetime import date
-        import re as _re
-        video_stem = os.path.splitext(os.path.basename(video_path))[0]
-        clean_name = _re.sub(r"[^\w\s]", " ", video_stem).strip()
-        words = clean_name.split()[:8]
-        short_name = " ".join(words) + f"_{date.today().strftime('%Y-%m-%d')}"
+            log(f"开始转写: {os.path.basename(video_path)}")
+            segments, info = model.transcribe(
+                video_path,
+                language=language if language else None,
+                beam_size=5,
+                vad_filter=True,
+                vad_parameters=dict(
+                    threshold=0.5,
+                    min_speech_duration_ms=0,
+                    max_speech_duration_s=3.0,
+                    min_silence_duration_ms=500,
+                    speech_pad_ms=400,
+                ),
+                word_timestamps=True,
+                condition_on_previous_text=False,
+                suppress_tokens=[-1],
+                initial_prompt=initial_prompt if initial_prompt.strip() else None,
+            )
+            log(f"检测语言: {info.language}，时长: {info.duration:.1f}s")
+            log("正在识别，请稍候...")
+
+            subs = []
+            for i, seg in enumerate(segments, 1):
+                subs.append(srt.Subtitle(
+                    index=i,
+                    start=timedelta(seconds=seg.start),
+                    end=timedelta(seconds=seg.end),
+                    content=seg.text.strip(),
+                ))
+                if i % 10 == 0:
+                    log(f"已识别 {i} 段，进度: {seg.start:.1f}s / {info.duration:.1f}s")
+
+            log(f"识别完成，共 {len(subs)} 段，开始切分...")
+            split_subs = []
+            for sub in subs:
+                split_subs.extend(srt_equalizer.split_subtitle(sub, max_chars))
+            for i, sub in enumerate(split_subs, 1):
+                sub.index = i
+
+            video_stem = os.path.splitext(os.path.basename(video_path))[0]
+            clean_name = _re.sub(r"[^\w\s]", " ", video_stem).strip()
+            words = clean_name.split()[:8]
+            short_name = " ".join(words) + f"_{date.today().strftime('%Y-%m-%d')}"
+            ref_dir = os.path.dirname(video_path)
 
         # 确定保存目录
         if save_path:
             save_dir = os.path.dirname(save_path)
             if not save_dir:
-                save_dir = os.path.dirname(video_path)
+                save_dir = ref_dir
         else:
-            save_dir = os.path.dirname(video_path)
+            save_dir = ref_dir
 
         base_path = os.path.join(save_dir, short_name)
 
-        # 先保存英文SRT
-        en_path = base_path + "_英文.srt"
-        with open(en_path, "w", encoding="utf-8") as f:
-            f.write(srt.compose(split_subs))
-        log(f"✅ 英文字幕已保存: {en_path}")
+        # 转写模式下保存英文 SRT；使用已有 SRT 时跳过
+        if not use_existing_srt:
+            en_path = base_path + "_英文.srt"
+            with open(en_path, "w", encoding="utf-8") as f:
+                f.write(srt.compose(split_subs))
+            log(f"✅ 英文字幕已保存: {en_path}")
 
         # 翻译
         if translate_enabled:
             if not api_key.strip():
                 log("❌ 未填写API Key，跳过翻译")
             else:
-                log(f"开始翻译，模型: {translate_model}，每批 {batch_size} 行...")
-                translations = {}
+                from concurrent.futures import ThreadPoolExecutor, as_completed
                 batches = [split_subs[i:i+batch_size] for i in range(0, len(split_subs), batch_size)]
-                for bi, batch in enumerate(batches):
-                    log(f"翻译第 {bi+1}/{len(batches)} 批...")
-                    result = translate_batch(batch, api_key, translate_model, log)
-                    translations.update(result)
-                    if result:
-                        log(f"✅ 第 {bi+1} 批翻译成功，共 {len(result)} 行")
+                log(f"开始翻译，模型: {translate_model}，每批 {batch_size} 行，共 {len(batches)} 批，3 路并发...")
+                translations = {}
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    future_to_bi = {
+                        executor.submit(translate_batch, batch, api_key, translate_model, log): bi
+                        for bi, batch in enumerate(batches)
+                    }
+                    for future in as_completed(future_to_bi):
+                        bi = future_to_bi[future]
+                        result = future.result()
+                        translations.update(result)
+                        done = sum(1 for f in future_to_bi if f.done())
+                        log(f"✅ 第 {bi+1}/{len(batches)} 批完成，共 {len(result)} 行（已完成 {done}/{len(batches)}）")
 
-                # 生成双语SRT
                 bilingual_subs = []
                 for sub in split_subs:
                     if sub.index in translations:
@@ -396,17 +421,24 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 w.drop_target_register(DND_FILES)
                 w.dnd_bind("<<Drop>>", self._on_drop)
 
-        # 模型路径
+        # 模型路径  (row=1 → grid rows 2,3)
         self.model_var = tk.StringVar(value=cfg["model_path"])
         self._entry_row(self, 1, "Whisper 模型路径", self.model_var, self._browse_model)
 
-        # 保存路径
+        # 保存路径  (row=2 → grid rows 4,5)
         self.save_var = tk.StringVar()
-        self._entry_row(self, 2, "SRT 保存路径（空=视频同目录）", self.save_var, self._browse_save, "另存为")
+        self._entry_row(self, 2, "SRT 保存路径（空=与源文件同目录）", self.save_var, self._browse_save, "另存为")
+
+        # 现有英文 SRT（可选）  (row=3 → grid rows 6,7)
+        self.srt_var = tk.StringVar()
+        srt_entry = self._entry_row(self, 3, "现有英文 SRT（可选，提供后跳过本地识别）", self.srt_var, self._browse_srt)
+        if HAS_DND:
+            srt_entry.drop_target_register(DND_FILES)
+            srt_entry.dnd_bind("<<Drop>>", self._on_drop_srt)
 
         # 选项行
         f_opts = tk.Frame(self, bg="#1e1e1e")
-        f_opts.grid(row=7, column=0, sticky="ew", padx=16, pady=8)
+        f_opts.grid(row=9, column=0, sticky="ew", padx=16, pady=8)
 
         def olbl(t): tk.Label(f_opts, text=t, bg="#1e1e1e", fg="#888888",
                                font=("Segoe UI", 9)).pack(side="left")
@@ -432,18 +464,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         oentry(self.chars_var, 5)
 
         # 初始提示词
-        self._lbl(self, "初始提示词（可选）").grid(row=8, column=0, sticky="w", padx=16, pady=(2, 0))
+        self._lbl(self, "初始提示词（可选）").grid(row=10, column=0, sticky="w", padx=16, pady=(2, 0))
         self.prompt_var = tk.StringVar(value=cfg["initial_prompt"])
         tk.Entry(self, textvariable=self.prompt_var, bg="#2d2d2d", fg="#ffffff",
                  insertbackground="white", relief="flat", font=("Segoe UI", 10), bd=4
-                 ).grid(row=9, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
+                 ).grid(row=11, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
 
         # ── 翻译区 ──────────────────────────────
         sep = tk.Frame(self, bg="#333333", height=1)
-        sep.grid(row=10, column=0, sticky="ew", padx=16, pady=(8, 0))
+        sep.grid(row=12, column=0, sticky="ew", padx=16, pady=(8, 0))
 
         f_trans_title = tk.Frame(self, bg="#1e1e1e")
-        f_trans_title.grid(row=11, column=0, sticky="ew", padx=16, pady=(6, 0))
+        f_trans_title.grid(row=13, column=0, sticky="ew", padx=16, pady=(6, 0))
         tk.Label(f_trans_title, text="  翻 译", bg="#1e1e1e", fg="#555555",
                  font=("Segoe UI", 8)).pack(side="left")
         self.translate_var = tk.BooleanVar(value=cfg.get("translate_enabled", False))
@@ -453,25 +485,25 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                        ).pack(side="left", padx=(16, 0))
 
         # API Key
-        self._lbl(self, "硅基流动 API Key").grid(row=12, column=0, sticky="w", padx=16, pady=(6, 0))
+        self._lbl(self, "硅基流动 API Key").grid(row=14, column=0, sticky="w", padx=16, pady=(6, 0))
         self.api_key_var = tk.StringVar(value=cfg["api_key"])
         tk.Entry(self, textvariable=self.api_key_var, bg="#2d2d2d", fg="#ffffff",
                  insertbackground="white", relief="flat", font=("Segoe UI", 10),
-                 bd=4, show="*").grid(row=13, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
+                 bd=4, show="*").grid(row=15, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
 
         # 翻译模型选择
         self._lbl(self, "翻译模型（可手动输入新模型后回车保存）").grid(
-            row=14, column=0, sticky="w", padx=16, pady=(2, 0))
+            row=16, column=0, sticky="w", padx=16, pady=(2, 0))
         all_models = DEFAULT_MODELS + cfg.get("custom_models", [])
         self.trans_model_var = tk.StringVar(value=cfg["translate_model"])
         self.trans_combo = ttk.Combobox(self, textvariable=self.trans_model_var,
                                          values=all_models, font=("Segoe UI", 10))
-        self.trans_combo.grid(row=15, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
+        self.trans_combo.grid(row=17, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
         self.trans_combo.bind("<Return>", self._add_custom_model)
 
         # 每批行数
         f_batch = tk.Frame(self, bg="#1e1e1e")
-        f_batch.grid(row=16, column=0, sticky="w", padx=16, pady=(2, 4))
+        f_batch.grid(row=18, column=0, sticky="w", padx=16, pady=(2, 4))
         tk.Label(f_batch, text="每批翻译行数", bg="#1e1e1e", fg="#888888",
                  font=("Segoe UI", 9)).pack(side="left")
         self.batch_var = tk.StringVar(value=cfg.get("batch_size", "15"))
@@ -484,14 +516,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                              bg="#0078d4", fg="#ffffff", relief="flat",
                              font=("Segoe UI", 11, "bold"), padx=24, pady=8,
                              cursor="hand2", activebackground="#005fa3")
-        self.btn.grid(row=17, column=0, pady=12)
+        self.btn.grid(row=19, column=0, pady=12)
 
         # 日志
-        self.rowconfigure(18, weight=1)
+        self.rowconfigure(20, weight=1)
         self.log_box = scrolledtext.ScrolledText(self, bg="#111111", fg="#cccccc",
                                                   font=("Consolas", 9), relief="flat",
                                                   state="disabled", height=10)
-        self.log_box.grid(row=18, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        self.log_box.grid(row=20, column=0, sticky="nsew", padx=16, pady=(0, 16))
 
     def _add_custom_model(self, event=None):
         val = self.trans_model_var.get().strip()
@@ -512,6 +544,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         path = event.data.strip().strip("{}")
         self.video_var.set(path)
         self.drop_label.configure(fg="#aaaaaa")
+
+    def _on_drop_srt(self, event):
+        path = event.data.strip().strip("{}")
+        self.srt_var.set(path)
 
     def _browse_video(self):
         path = filedialog.askopenfilename(
@@ -535,18 +571,30 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if path:
             self.save_var.set(path)
 
+    def _browse_srt(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("SRT字幕", "*.srt"), ("所有文件", "*.*")])
+        if path:
+            self.srt_var.set(path)
+
     def _log(self, msg):
         self._log_queue.put(msg)
 
     def _start(self):
         video = self.video_var.get().strip()
+        srt_file = self.srt_var.get().strip()
         model = self.model_var.get().strip()
-        if not video:
-            self._log("❌ 请先选择视频文件")
+
+        if not video and not srt_file:
+            self._log("❌ 请先选择视频文件，或提供已有英文 SRT")
             return
-        if not model:
-            self._log("❌ 请先选择模型路径")
+        if srt_file and not os.path.exists(srt_file):
+            self._log("❌ SRT 文件不存在，请重新选择")
             return
+        if not srt_file and not model:
+            self._log("❌ 请先选择 Whisper 模型路径")
+            return
+
         try:
             max_chars = int(self.chars_var.get())
         except ValueError:
@@ -559,6 +607,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         config = {
             "video_path": video,
+            "srt_path": srt_file,
             "model_path": model,
             "device": self.device_var.get(),
             "compute_type": self.compute_var.get(),
@@ -575,7 +624,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._do_save_config()
         self._is_running = True
         self.btn.configure(state="disabled", text="处理中...")
-        self._log(f"▶ {os.path.basename(video)}")
+        label = os.path.basename(srt_file) if srt_file else os.path.basename(video)
+        self._log(f"▶ {label}")
 
         def task():
             run_transcribe(config, self._log)
