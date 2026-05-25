@@ -38,7 +38,7 @@ except ImportError:
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
-DEFAULT_MODELS = [
+DEFAULT_MODELS_SF = [
     "deepseek-ai/DeepSeek-V4-Flash",
     "deepseek-ai/DeepSeek-V3.2",
     "deepseek-ai/DeepSeek-V3.1-Terminus",
@@ -48,6 +48,13 @@ DEFAULT_MODELS = [
     "MiniMaxAI/MiniMax-M2.5",
 ]
 
+DEFAULT_MODELS_ARK = [
+    "deepseek-v3-2-251201",
+    "deepseek-r1-250528",
+    "doubao-pro-32k-241215",
+    "doubao-pro-256k-241115",
+]
+
 DEFAULT_CONFIG = {
     "model_path": "",
     "device": "cuda",
@@ -55,9 +62,13 @@ DEFAULT_CONFIG = {
     "language": "en",
     "max_chars": "42",
     "initial_prompt": "",
+    "provider": "siliconflow",
     "api_key": "",
-    "translate_model": DEFAULT_MODELS[0],
+    "translate_model": DEFAULT_MODELS_SF[0],
     "custom_models": [],
+    "ark_api_key": "",
+    "ark_model": DEFAULT_MODELS_ARK[0],
+    "ark_custom_models": [],
     "translate_enabled": False,
     "batch_size": "15",
 }
@@ -84,16 +95,35 @@ def save_config(cfg):
         pass
 
 
+def _parse_translation(content):
+    """解析翻译响应，返回 {index: (zh, emoji)} 字典"""
+    parsed = {}
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^(\d+)\.\s*(.+)$", line)
+        if m:
+            idx = int(m.group(1))
+            rest = m.group(2).strip()
+            emoji = ""
+            text_part = rest
+            for i, ch in enumerate(rest):
+                if ord(ch) > 127:
+                    emoji = ch
+                    text_part = rest[i+1:].strip()
+                    break
+                else:
+                    break
+            parsed[idx] = (text_part, emoji)
+    return parsed
+
+
 def translate_batch(subs_batch, api_key, model, log):
-    """翻译一批字幕，返回{index: (zh, emoji)}字典"""
+    """硅基流动翻译，返回 {index: (zh, emoji)} 字典"""
     import urllib.request
-    import urllib.error
 
-    lines = []
-    for sub in subs_batch:
-        lines.append(f"{sub.index}. {sub.content}")
-    text = "\n".join(lines)
-
+    lines = [f"{sub.index}. {sub.content}" for sub in subs_batch]
     prompt = f"""你是专业字幕翻译，请将以下英文字幕翻译为中文，并为每行选一个最贴切的表情符号。
 
 要求：
@@ -102,13 +132,11 @@ def translate_batch(subs_batch, api_key, model, log):
 - 只输出翻译结果，不要解释
 
 字幕内容：
-{text}"""
+{chr(10).join(lines)}"""
 
     payload = json.dumps({
         "model": model,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
         "max_tokens": 2000,
     }).encode("utf-8")
@@ -116,10 +144,7 @@ def translate_batch(subs_batch, api_key, model, log):
     req = urllib.request.Request(
         "https://api.siliconflow.cn/v1/chat/completions",
         data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
         method="POST"
     )
 
@@ -140,30 +165,71 @@ def translate_batch(subs_batch, api_key, model, log):
             if attempt < 2:
                 import time
                 time.sleep(3)
-    if content is None:
-        return {}
 
-    parsed = {}
-    for line in content.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        m = re.match(r"^(\d+)\.\s*(.+)$", line)
-        if m:
-            idx = int(m.group(1))
-            rest = m.group(2).strip()
-            emoji = ""
-            text_part = rest
-            for i, ch in enumerate(rest):
-                if ord(ch) > 127:
-                    emoji = ch
-                    text_part = rest[i+1:].strip()
-                    break
-                else:
-                    break
-            parsed[idx] = (text_part, emoji)
+    return _parse_translation(content) if content else {}
 
-    return parsed
+
+def translate_batch_ark(subs_batch, api_key, model, log):
+    """火山引擎 ARK 翻译，返回 {index: (zh, emoji)} 字典"""
+    import urllib.request
+
+    lines = [f"{sub.index}. {sub.content}" for sub in subs_batch]
+    prompt = f"""你是专业字幕翻译，请将以下英文字幕翻译为中文，并为每行选一个最贴切的表情符号。
+
+要求：
+- 严格保持行号一一对应，不合并不拆分
+- 每行输出格式：行号. 表情 中文翻译
+- 只输出翻译结果，不要解释
+
+字幕内容：
+{chr(10).join(lines)}"""
+
+    payload = json.dumps({
+        "model": model,
+        "stream": False,
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}]
+            }
+        ],
+        "temperature": 0.3,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://ark.cn-beijing.volces.com/api/v3/responses",
+        data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST"
+    )
+
+    content = None
+    for attempt in range(3):
+        try:
+            log("  → 等待 ARK 响应...")
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            for item in result.get("output", []):
+                if item.get("type") == "message":
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            content = c["text"].strip()
+                            break
+                if content:
+                    break
+            if content:
+                log("  ← 收到响应：")
+                for line in content.splitlines():
+                    if line.strip():
+                        log(f"    {line}")
+                break
+        except Exception as e:
+            log(f"⚠️ 第{attempt+1}次请求失败: {e}，{'重试中...' if attempt < 2 else '跳过本批'}")
+            if attempt < 2:
+                import time
+                time.sleep(3)
+
+    return _parse_translation(content) if content else {}
 
 
 def run_transcribe(config, log):
@@ -183,14 +249,15 @@ def run_transcribe(config, log):
         initial_prompt = config["initial_prompt"]
         save_path = config["save_path"]
         translate_enabled = config["translate_enabled"]
-        api_key = config["api_key"]
-        translate_model = config["translate_model"]
+        provider = config.get("provider", "siliconflow")
+        api_key = config["api_key"] if provider == "siliconflow" else config.get("ark_api_key", "")
+        translate_model = config["translate_model"] if provider == "siliconflow" else config.get("ark_model", "")
         batch_size = config["batch_size"]
+        translate_fn = translate_batch if provider == "siliconflow" else translate_batch_ark
 
         use_existing_srt = bool(srt_path and os.path.exists(srt_path))
 
         if use_existing_srt:
-            # 直接加载已有英文字幕，跳过转写
             log(f"使用已有英文字幕: {os.path.basename(srt_path)}")
             with open(srt_path, "r", encoding="utf-8") as f:
                 split_subs = list(srt.parse(f.read()))
@@ -253,7 +320,6 @@ def run_transcribe(config, log):
             short_name = " ".join(words) + f"_{date.today().strftime('%Y-%m-%d')}"
             ref_dir = os.path.dirname(video_path)
 
-        # 确定保存目录
         if save_path:
             save_dir = os.path.dirname(save_path)
             if not save_dir:
@@ -263,25 +329,24 @@ def run_transcribe(config, log):
 
         base_path = os.path.join(save_dir, short_name)
 
-        # 转写模式下保存英文 SRT；使用已有 SRT 时跳过
         if not use_existing_srt:
             en_path = base_path + "_英文.srt"
             with open(en_path, "w", encoding="utf-8") as f:
                 f.write(srt.compose(split_subs))
             log(f"✅ 英文字幕已保存: {en_path}")
 
-        # 翻译
         if translate_enabled:
             if not api_key.strip():
                 log("❌ 未填写API Key，跳过翻译")
             else:
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 batches = [split_subs[i:i+batch_size] for i in range(0, len(split_subs), batch_size)]
-                log(f"开始翻译，模型: {translate_model}，每批 {batch_size} 行，共 {len(batches)} 批，3 路并发...")
+                provider_name = "硅基流动" if provider == "siliconflow" else "火山引擎 ARK"
+                log(f"开始翻译，{provider_name} / {translate_model}，每批 {batch_size} 行，共 {len(batches)} 批，3 路并发...")
                 translations = {}
                 with ThreadPoolExecutor(max_workers=3) as executor:
                     future_to_bi = {
-                        executor.submit(translate_batch, batch, api_key, translate_model, log): bi
+                        executor.submit(translate_fn, batch, api_key, translate_model, log): bi
                         for bi, batch in enumerate(batches)
                     }
                     for future in as_completed(future_to_bi):
@@ -299,10 +364,7 @@ def run_transcribe(config, log):
                     else:
                         content = sub.content
                     bilingual_subs.append(srt.Subtitle(
-                        index=sub.index,
-                        start=sub.start,
-                        end=sub.end,
-                        content=content,
+                        index=sub.index, start=sub.start, end=sub.end, content=content,
                     ))
 
                 bi_path = base_path + "_双语.srt"
@@ -340,10 +402,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.destroy()
 
     def _do_save_config(self):
-        custom = self._saved_config.get("custom_models", [])
+        provider = self.provider_var.get()
+        sf_custom = self._saved_config.get("custom_models", [])
+        ark_custom = self._saved_config.get("ark_custom_models", [])
         cur = self.trans_model_var.get().strip()
-        if cur and cur not in DEFAULT_MODELS and cur not in custom:
-            custom.append(cur)
+        if provider == "siliconflow":
+            if cur and cur not in DEFAULT_MODELS_SF and cur not in sf_custom:
+                sf_custom.append(cur)
+        else:
+            if cur and cur not in DEFAULT_MODELS_ARK and cur not in ark_custom:
+                ark_custom.append(cur)
         save_config({
             "model_path": self.model_var.get().strip(),
             "device": self.device_var.get(),
@@ -351,9 +419,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "language": self.lang_var.get().strip(),
             "max_chars": self.chars_var.get().strip(),
             "initial_prompt": self.prompt_var.get(),
-            "api_key": self.api_key_var.get().strip(),
-            "translate_model": self.trans_model_var.get().strip(),
-            "custom_models": custom,
+            "provider": provider,
+            "api_key": self.sf_key_var.get().strip(),
+            "translate_model": self.trans_model_var.get().strip() if provider == "siliconflow" else self._saved_config.get("translate_model", DEFAULT_MODELS_SF[0]),
+            "custom_models": sf_custom,
+            "ark_api_key": self.ark_key_var.get().strip(),
+            "ark_model": self.trans_model_var.get().strip() if provider == "volcengine" else self._saved_config.get("ark_model", DEFAULT_MODELS_ARK[0]),
+            "ark_custom_models": ark_custom,
             "translate_enabled": self.translate_var.get(),
             "batch_size": self.batch_var.get().strip(),
         })
@@ -399,7 +471,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tk.Label(self, text="  转 写", bg="#1e1e1e", fg="#555555",
                  font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w", padx=16, pady=(12, 0))
 
-        # 拖拽区
         self.video_var = tk.StringVar()
         drop_frame = tk.Frame(self, bg="#252525")
         drop_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=(2, 4))
@@ -484,26 +555,49 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                        activebackground="#1e1e1e", font=("Segoe UI", 9)
                        ).pack(side="left", padx=(16, 0))
 
-        # API Key
-        self._lbl(self, "硅基流动 API Key").grid(row=14, column=0, sticky="w", padx=16, pady=(6, 0))
-        self.api_key_var = tk.StringVar(value=cfg["api_key"])
-        tk.Entry(self, textvariable=self.api_key_var, bg="#2d2d2d", fg="#ffffff",
-                 insertbackground="white", relief="flat", font=("Segoe UI", 10),
-                 bd=4, show="*").grid(row=15, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
+        # 翻译服务选择
+        f_provider = tk.Frame(self, bg="#1e1e1e")
+        f_provider.grid(row=14, column=0, sticky="w", padx=16, pady=(4, 0))
+        tk.Label(f_provider, text="翻译服务", bg="#1e1e1e", fg="#888888",
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.provider_var = tk.StringVar(value=cfg.get("provider", "siliconflow"))
+        for val, txt in [("siliconflow", "硅基流动"), ("volcengine", "火山引擎 ARK")]:
+            tk.Radiobutton(f_provider, text=txt, variable=self.provider_var, value=val,
+                           bg="#1e1e1e", fg="#aaaaaa", selectcolor="#2d2d2d",
+                           activebackground="#1e1e1e", font=("Segoe UI", 9),
+                           command=self._on_provider_change
+                           ).pack(side="left", padx=(12, 0))
 
-        # 翻译模型选择
+        # 硅基流动 API Key（row 15, 16）
+        self._sf_key_lbl = self._lbl(self, "硅基流动 API Key")
+        self._sf_key_lbl.grid(row=15, column=0, sticky="w", padx=16, pady=(6, 0))
+        self.sf_key_var = tk.StringVar(value=cfg.get("api_key", ""))
+        self._sf_key_entry = tk.Entry(self, textvariable=self.sf_key_var, bg="#2d2d2d", fg="#ffffff",
+                                      insertbackground="white", relief="flat",
+                                      font=("Segoe UI", 10), bd=4, show="*")
+        self._sf_key_entry.grid(row=16, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
+
+        # 火山引擎 ARK API Key（row 15, 16 — 同位置，按 provider 切换）
+        self._ark_key_lbl = self._lbl(self, "火山引擎 ARK API Key")
+        self._ark_key_lbl.grid(row=15, column=0, sticky="w", padx=16, pady=(6, 0))
+        self.ark_key_var = tk.StringVar(value=cfg.get("ark_api_key", ""))
+        self._ark_key_entry = tk.Entry(self, textvariable=self.ark_key_var, bg="#2d2d2d", fg="#ffffff",
+                                       insertbackground="white", relief="flat",
+                                       font=("Segoe UI", 10), bd=4, show="*")
+        self._ark_key_entry.grid(row=16, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
+
+        # 翻译模型
         self._lbl(self, "翻译模型（可手动输入新模型后回车保存）").grid(
-            row=16, column=0, sticky="w", padx=16, pady=(2, 0))
-        all_models = DEFAULT_MODELS + cfg.get("custom_models", [])
-        self.trans_model_var = tk.StringVar(value=cfg["translate_model"])
+            row=17, column=0, sticky="w", padx=16, pady=(2, 0))
+        self.trans_model_var = tk.StringVar()
         self.trans_combo = ttk.Combobox(self, textvariable=self.trans_model_var,
-                                         values=all_models, font=("Segoe UI", 10))
-        self.trans_combo.grid(row=17, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
+                                         font=("Segoe UI", 10))
+        self.trans_combo.grid(row=18, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
         self.trans_combo.bind("<Return>", self._add_custom_model)
 
         # 每批行数
         f_batch = tk.Frame(self, bg="#1e1e1e")
-        f_batch.grid(row=18, column=0, sticky="w", padx=16, pady=(2, 4))
+        f_batch.grid(row=19, column=0, sticky="w", padx=16, pady=(2, 4))
         tk.Label(f_batch, text="每批翻译行数", bg="#1e1e1e", fg="#888888",
                  font=("Segoe UI", 9)).pack(side="left")
         self.batch_var = tk.StringVar(value=cfg.get("batch_size", "15"))
@@ -516,14 +610,37 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                              bg="#0078d4", fg="#ffffff", relief="flat",
                              font=("Segoe UI", 11, "bold"), padx=24, pady=8,
                              cursor="hand2", activebackground="#005fa3")
-        self.btn.grid(row=19, column=0, pady=12)
+        self.btn.grid(row=20, column=0, pady=12)
 
         # 日志
-        self.rowconfigure(20, weight=1)
+        self.rowconfigure(21, weight=1)
         self.log_box = scrolledtext.ScrolledText(self, bg="#111111", fg="#cccccc",
                                                   font=("Consolas", 9), relief="flat",
                                                   state="disabled", height=10)
-        self.log_box.grid(row=20, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        self.log_box.grid(row=21, column=0, sticky="nsew", padx=16, pady=(0, 16))
+
+        # 初始化 provider 显示状态
+        self._on_provider_change()
+
+    def _on_provider_change(self):
+        provider = self.provider_var.get()
+        cfg = self._saved_config
+        if provider == "siliconflow":
+            self._ark_key_lbl.grid_remove()
+            self._ark_key_entry.grid_remove()
+            self._sf_key_lbl.grid()
+            self._sf_key_entry.grid()
+            models = DEFAULT_MODELS_SF + cfg.get("custom_models", [])
+            saved_model = cfg.get("translate_model", DEFAULT_MODELS_SF[0])
+        else:
+            self._sf_key_lbl.grid_remove()
+            self._sf_key_entry.grid_remove()
+            self._ark_key_lbl.grid()
+            self._ark_key_entry.grid()
+            models = DEFAULT_MODELS_ARK + cfg.get("ark_custom_models", [])
+            saved_model = cfg.get("ark_model", DEFAULT_MODELS_ARK[0])
+        self.trans_combo["values"] = models
+        self.trans_model_var.set(saved_model if saved_model in models else models[0])
 
     def _add_custom_model(self, event=None):
         val = self.trans_model_var.get().strip()
@@ -534,10 +651,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             current.append(val)
             self.trans_combo["values"] = current
             cfg = self._saved_config
-            custom = cfg.get("custom_models", [])
+            key = "custom_models" if self.provider_var.get() == "siliconflow" else "ark_custom_models"
+            custom = cfg.get(key, [])
             if val not in custom:
                 custom.append(val)
-            cfg["custom_models"] = custom
+            cfg[key] = custom
             self._log(f"已添加模型: {val}")
 
     def _on_drop(self, event):
@@ -605,6 +723,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         except ValueError:
             batch_size = 15
 
+        provider = self.provider_var.get()
         config = {
             "video_path": video,
             "srt_path": srt_file,
@@ -616,8 +735,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "initial_prompt": self.prompt_var.get(),
             "save_path": self.save_var.get().strip(),
             "translate_enabled": self.translate_var.get(),
-            "api_key": self.api_key_var.get().strip(),
-            "translate_model": self.trans_model_var.get().strip(),
+            "provider": provider,
+            "api_key": self.sf_key_var.get().strip(),
+            "ark_api_key": self.ark_key_var.get().strip(),
+            "translate_model": self.trans_model_var.get().strip() if provider == "siliconflow" else "",
+            "ark_model": self.trans_model_var.get().strip() if provider == "volcengine" else "",
             "batch_size": batch_size,
         }
 
