@@ -6,6 +6,7 @@ faster-whisper 字幕生成 + 双语翻译工具
 import os
 import sys
 
+
 def _setup_cuda_paths():
     import site
     site_packages = site.getsitepackages()[0]
@@ -20,15 +21,14 @@ def _setup_cuda_paths():
     if dirs_to_add:
         os.environ["PATH"] = os.pathsep.join(dirs_to_add) + os.pathsep + os.environ.get("PATH", "")
 
+
 _setup_cuda_paths()
 
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 import threading
 import queue
-import json
 import re
-from datetime import timedelta
 
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
@@ -36,717 +36,164 @@ try:
 except ImportError:
     HAS_DND = False
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-
-DEFAULT_MODELS_SF = [
-    "deepseek-ai/DeepSeek-V4-Flash",
-    "deepseek-ai/DeepSeek-V3.2",
-    "deepseek-ai/DeepSeek-V3.1-Terminus",
-    "Pro/deepseek-ai/DeepSeek-V3.1-Terminus",
-    "Qwen/Qwen3.6-35B-A3B",
-    "Qwen/Qwen3.6-27B",
-    "MiniMaxAI/MiniMax-M2.5",
-]
-
-DEFAULT_MODELS_ARK = [
-    "deepseek-v3-2-251201",
-    "deepseek-r1-250528",
-    "doubao-pro-32k-241215",
-    "doubao-pro-256k-241115",
-]
-
-DEFAULT_MODELS_GEMINI = [
-    "gemini-2.5-flash",
-    "gemini-3.5-flash",
-    "gemini-2.5-pro",
-    "gemini-3.1-pro-preview",
-    "gemini-3-flash-preview",
-    "gemini-3.1-flash-lite",
-    "gemini-2.5-flash-lite",
-]
-
-DEFAULT_CONFIG = {
-    "model_path": "",
-    "device": "cuda",
-    "compute_type": "int8",
-    "language": "en",
-    "max_chars": "42",
-    "initial_prompt": "",
-    "provider": "siliconflow",
-    "api_key": "",
-    "translate_model": DEFAULT_MODELS_SF[0],
-    "custom_models": [],
-    "ark_api_key": "",
-    "ark_model": DEFAULT_MODELS_ARK[0],
-    "ark_custom_models": [],
-    "gemini_api_keys": "",
-    "gemini_model": DEFAULT_MODELS_GEMINI[0],
-    "gemini_custom_models": [],
-    "gemini_threads": "1",
-    "translate_enabled": False,
-    "batch_size": "15",
-    "download_dir": "",
-}
-
-_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
-
-def _clean(msg):
-    return _ANSI_RE.sub('', str(msg))
-
-# Common language code → display name
-_LANG_NAMES = {
-    'en': '英语', 'zh': '中文', 'zh-Hans': '中文（简体）', 'zh-Hant': '中文（繁体）',
-    'ja': '日语', 'ko': '韩语', 'fr': '法语', 'de': '德语', 'es': '西班牙语',
-    'ru': '俄语', 'ar': '阿拉伯语', 'pt': '葡萄牙语', 'it': '意大利语',
-    'nl': '荷兰语', 'pl': '波兰语', 'tr': '土耳其语', 'vi': '越南语',
-    'th': '泰语', 'id': '印尼语', 'hi': '印地语',
-}
+from backend import (
+    load_config, save_config,
+    DEFAULT_MODELS_SF, DEFAULT_MODELS_ARK, DEFAULT_MODELS_GEMINI, DEFAULT_CONFIG,
+    translate_batch, translate_batch_ark, translate_batch_gemini,
+    chat_completion,
+    run_transcribe, query_video_info, run_download,
+)
 
 
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                cfg = DEFAULT_CONFIG.copy()
-                cfg.update(data)
-                return cfg
-        except Exception:
-            pass
-    return DEFAULT_CONFIG.copy()
+# ── Windows dark title bar ────────────────────────────────────────────────────
 
-
-def save_config(cfg):
+def _apply_dark_titlebar(window):
+    if sys.platform != "win32":
+        return
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        import ctypes
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        if hwnd == 0:
+            hwnd = window.winfo_id()
+        value = ctypes.c_int(1)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            ctypes.byref(value), ctypes.sizeof(value)
+        )
     except Exception:
         pass
 
 
-def _flatten_youtube_subs(subs, srt_mod):
-    """
-    处理 YouTube 滚动字幕格式：
-    提取每条唯一文字的首次出现时刻，以下一条新文字首次出现为结束，
-    产生严格不重叠的干净字幕序列。
-    """
-    if not subs:
-        return subs
-
-    seen = set()
-    order = []       # 按首次出现顺序排列的唯一行文本
-    first_time = {}  # text → 首次出现的 start 时间
-
-    for sub in subs:
-        for ln in sub.content.splitlines():
-            ln = ln.strip()
-            if ln and ln not in seen:
-                seen.add(ln)
-                first_time[ln] = sub.start
-                order.append(ln)
-
-    result = []
-    for i, text in enumerate(order):
-        start = first_time[text]
-        end = first_time[order[i + 1]] if i + 1 < len(order) else subs[-1].end
-        if end > start:
-            result.append(srt_mod.Subtitle(len(result) + 1, start, end, text))
-
-    return result
-
-
-def _parse_translation(content):
-    parsed = {}
-    for line in content.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        m = re.match(r"^(\d+)\.\s*(.+)$", line)
-        if m:
-            idx = int(m.group(1))
-            rest = m.group(2).strip()
-            emoji = ""
-            text_part = rest
-            for i, ch in enumerate(rest):
-                if ord(ch) > 127:
-                    emoji = ch
-                    text_part = rest[i+1:].strip()
-                    break
-                else:
-                    break
-            text_part = text_part.rstrip("，。！？；：、…·")
-            parsed[idx] = (text_part, emoji)
-    return parsed
-
-
-def translate_batch(subs_batch, api_key, model, log):
-    import urllib.request
-
-    lines = [f"{sub.index}. {sub.content}" for sub in subs_batch]
-    prompt = f"""你是专业字幕翻译，请将以下英文字幕翻译为中文，并为每行选一个最贴切的表情符号。
-
-要求：
-- 严格保持行号一一对应，不合并不拆分
-- 每行输出格式：行号. 表情 中文翻译
-- 只输出翻译结果，不要解释
-
-字幕内容：
-{chr(10).join(lines)}"""
-
-    payload = json.dumps({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": 2000,
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://api.siliconflow.cn/v1/chat/completions",
-        data=payload,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-        method="POST"
-    )
-
-    content = None
-    for attempt in range(3):
-        try:
-            log("  → 等待 API 响应...")
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-                content = result["choices"][0]["message"]["content"].strip()
-            log("  ← 收到响应：")
-            for line in content.splitlines():
-                if line.strip():
-                    log(f"    {line}")
-            break
-        except Exception as e:
-            log(f"⚠️ 第{attempt+1}次请求失败: {e}，{'重试中...' if attempt < 2 else '跳过本批'}")
-            if attempt < 2:
-                import time
-                time.sleep(3)
-
-    return _parse_translation(content) if content else {}
-
-
-def translate_batch_ark(subs_batch, api_key, model, log):
-    import urllib.request
-
-    lines = [f"{sub.index}. {sub.content}" for sub in subs_batch]
-    prompt = f"""你是专业字幕翻译，请将以下英文字幕翻译为中文，并为每行选一个最贴切的表情符号。
-
-要求：
-- 严格保持行号一一对应，不合并不拆分
-- 每行输出格式：行号. 表情 中文翻译
-- 只输出翻译结果，不要解释
-
-字幕内容：
-{chr(10).join(lines)}"""
-
-    payload = json.dumps({
-        "model": model,
-        "stream": False,
-        "input": [
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": prompt}]
-            }
-        ],
-        "temperature": 0.3,
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        "https://ark.cn-beijing.volces.com/api/v3/responses",
-        data=payload,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-        method="POST"
-    )
-
-    content = None
-    for attempt in range(3):
-        try:
-            log("  → 等待 ARK 响应...")
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-            for item in result.get("output", []):
-                if item.get("type") == "message":
-                    for c in item.get("content", []):
-                        if c.get("type") == "output_text":
-                            content = c["text"].strip()
-                            break
-                if content:
-                    break
-            if content:
-                log("  ← 收到响应：")
-                for line in content.splitlines():
-                    if line.strip():
-                        log(f"    {line}")
-                break
-        except Exception as e:
-            log(f"⚠️ 第{attempt+1}次请求失败: {e}，{'重试中...' if attempt < 2 else '跳过本批'}")
-            if attempt < 2:
-                import time
-                time.sleep(3)
-
-    return _parse_translation(content) if content else {}
-
-
-def translate_batch_gemini(subs_batch, keys, start_key_idx, model, log, stop_event=None):
-    import urllib.request
-    import urllib.error
-    import time
-
-    def _wait(seconds):
-        """可被 stop_event 打断的 sleep，返回 True 表示被停止。"""
-        deadline = time.time() + seconds
-        while time.time() < deadline:
-            if stop_event and stop_event.is_set():
-                return True
-            time.sleep(0.3)
-        return False
-
-    lines = [f"{sub.index}. {sub.content}" for sub in subs_batch]
-    prompt = f"""你是专业字幕翻译，请将以下英文字幕翻译为中文，并为每行选一个最贴切的表情符号。
-
-要求：
-- 严格保持行号一一对应，不合并不拆分
-- 每行输出格式：行号. 表情 中文翻译
-- 只输出翻译结果，不要解释
-
-字幕内容：
-{chr(10).join(lines)}"""
-
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2000},
-    }).encode("utf-8")
-
-    n = len(keys)
-    # 最多尝试：遍历所有 key 2 轮，每轮全部 429 才等待一次
-    for round_ in range(2):
-        for ki in range(n):
-            if stop_event and stop_event.is_set():
-                return {}
-            key = keys[(start_key_idx + ki) % n]
-            key_label = f"Key{(start_key_idx + ki) % n + 1}"
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-            req = urllib.request.Request(
-                url, data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            try:
-                log(f"  → [{key_label}] 等待 Gemini 响应...")
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    result = json.loads(resp.read().decode("utf-8"))
-                content = result["candidates"][0]["content"]["parts"][0]["text"].strip()
-                log("  ← 收到响应：")
-                for line in content.splitlines():
-                    if line.strip():
-                        log(f"    {line}")
-                return _parse_translation(content)
-            except urllib.error.HTTPError as e:
-                if e.code == 429:
-                    log(f"  ⚠️ [{key_label}] 限速 (429)，切换下一个 Key...")
-                else:
-                    log(f"  ⚠️ [{key_label}] 请求失败: {e}")
-            except Exception as e:
-                log(f"  ⚠️ [{key_label}] 请求失败: {e}")
-        # 所有 key 本轮均失败，等待后重试
-        if round_ == 0:
-            log("⚠️ 所有 Key 均限速，等待 30s 后重试（点停止可立即中断）...")
-            if _wait(30):
-                return {}
-
-    log("⚠️ 跳过本批（所有 Key 均已耗尽）")
-    return {}
-
-
-def run_transcribe(config, log, stop_event=None):
-    try:
-        import srt
-        from srt_equalizer import srt_equalizer
-        from datetime import date
-        import re as _re
-
-        video_path = config.get("video_path", "")
-        srt_path = config.get("srt_path", "")
-        model_path = config.get("model_path", "")
-        device = config["device"]
-        compute_type = config["compute_type"]
-        language = config["language"]
-        max_chars = config["max_chars"]
-        initial_prompt = config["initial_prompt"]
-        save_path = config["save_path"]
-        translate_enabled = config["translate_enabled"]
-        provider = config.get("provider", "siliconflow")
-        if provider == "siliconflow":
-            api_key = config["api_key"]
-            translate_model = config["translate_model"]
-            translate_fn = translate_batch
-        elif provider == "volcengine":
-            api_key = config.get("ark_api_key", "")
-            translate_model = config.get("ark_model", "")
-            translate_fn = translate_batch_ark
-        else:
-            raw_keys = config.get("gemini_api_keys", "")
-            gemini_keys = [k.strip() for k in raw_keys.splitlines() if k.strip()]
-            api_key = gemini_keys[0] if gemini_keys else ""
-            translate_model = config.get("gemini_model", DEFAULT_MODELS_GEMINI[0])
-            translate_fn = None  # Gemini uses its own call path below
-        batch_size = config["batch_size"]
-
-        use_existing_srt = bool(srt_path and os.path.exists(srt_path))
-
-        if use_existing_srt:
-            log(f"使用已有英文字幕: {os.path.basename(srt_path)}")
-            with open(srt_path, "r", encoding="utf-8") as f:
-                raw_subs = list(srt.parse(f.read()))
-            log(f"已加载 {len(raw_subs)} 条字幕，处理 YouTube 滚动字幕格式...")
-            raw_subs = _flatten_youtube_subs(raw_subs, srt)
-            log(f"展开后 {len(raw_subs)} 条，开始按 {max_chars} 字符切分...")
-            split_subs = []
-            for sub in raw_subs:
-                split_subs.extend(srt_equalizer.split_subtitle(sub, max_chars))
-            for i, sub in enumerate(split_subs, 1):
-                sub.index = i
-            log(f"切分完成，共 {len(split_subs)} 条")
-
-            srt_stem = os.path.splitext(os.path.basename(srt_path))[0]
-            if srt_stem.endswith("_英文"):
-                srt_stem = srt_stem[:-3]
-            short_name = srt_stem
-            ref_dir = os.path.dirname(os.path.abspath(srt_path))
-        else:
-            from faster_whisper import WhisperModel
-
-            log(f"加载模型: {model_path}")
-            model = WhisperModel(model_path, device=device, compute_type=compute_type)
-            log("模型加载完成")
-
-            log(f"开始转写: {os.path.basename(video_path)}")
-            segments, info = model.transcribe(
-                video_path,
-                language=language if language else None,
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters=dict(
-                    threshold=0.5,
-                    min_speech_duration_ms=0,
-                    max_speech_duration_s=3.0,
-                    min_silence_duration_ms=500,
-                    speech_pad_ms=400,
-                ),
-                word_timestamps=True,
-                condition_on_previous_text=False,
-                suppress_tokens=[-1],
-                initial_prompt=initial_prompt if initial_prompt.strip() else None,
-            )
-            log(f"检测语言: {info.language}，时长: {info.duration:.1f}s")
-            log("正在识别，请稍候...")
-
-            subs = []
-            for i, seg in enumerate(segments, 1):
-                subs.append(srt.Subtitle(
-                    index=i,
-                    start=timedelta(seconds=seg.start),
-                    end=timedelta(seconds=seg.end),
-                    content=seg.text.strip(),
-                ))
-                if i % 10 == 0:
-                    log(f"已识别 {i} 段，进度: {seg.start:.1f}s / {info.duration:.1f}s")
-
-            log(f"识别完成，共 {len(subs)} 段，开始切分...")
-            split_subs = []
-            for sub in subs:
-                split_subs.extend(srt_equalizer.split_subtitle(sub, max_chars))
-            for i, sub in enumerate(split_subs, 1):
-                sub.index = i
-
-            video_stem = os.path.splitext(os.path.basename(video_path))[0]
-            clean_name = _re.sub(r"[^\w\s]", " ", video_stem).strip()
-            words = clean_name.split()[:8]
-            short_name = " ".join(words) + f"_{date.today().strftime('%Y-%m-%d')}"
-            ref_dir = os.path.dirname(video_path)
-
-        if save_path:
-            save_dir = os.path.dirname(save_path)
-            if not save_dir:
-                save_dir = ref_dir
-        else:
-            save_dir = ref_dir
-
-        base_path = os.path.join(save_dir, short_name)
-
-        if not use_existing_srt:
-            en_path = base_path + "_英文.srt"
-            with open(en_path, "w", encoding="utf-8") as f:
-                f.write(srt.compose(split_subs))
-            log(f"✅ 英文字幕已保存: {en_path}")
-
-        if translate_enabled:
-            if not api_key.strip():
-                log("❌ 未填写API Key，跳过翻译")
-            else:
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-                batches = [split_subs[i:i+batch_size] for i in range(0, len(split_subs), batch_size)]
-                provider_name = {"siliconflow": "硅基流动", "volcengine": "火山引擎 ARK"}.get(provider, "Google Gemini")
-
-                if provider == "gemini":
-                    concurrency = max(1, int(config.get("gemini_threads", 1)))
-                else:
-                    concurrency = 3
-
-                log(f"开始翻译，{provider_name} / {translate_model}，每批 {batch_size} 行，共 {len(batches)} 批，{concurrency} 路并发...")
-                translations = {}
-                stopped = False
-
-                with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                    if provider == "gemini":
-                        future_to_bi = {
-                            executor.submit(translate_batch_gemini, batch, gemini_keys, bi % len(gemini_keys), translate_model, log, stop_event): bi
-                            for bi, batch in enumerate(batches)
-                        }
-                    else:
-                        future_to_bi = {
-                            executor.submit(translate_fn, batch, api_key, translate_model, log): bi
-                            for bi, batch in enumerate(batches)
-                        }
-                    for future in as_completed(future_to_bi):
-                        bi = future_to_bi[future]
-                        result = future.result()
-                        translations.update(result)
-                        done = sum(1 for f in future_to_bi if f.done())
-                        log(f"✅ 第 {bi+1}/{len(batches)} 批完成，共 {len(result)} 行（已完成 {done}/{len(batches)}）")
-                        if stop_event and stop_event.is_set():
-                            for f in future_to_bi:
-                                f.cancel()
-                            stopped = True
-                            break
-
-                bilingual_subs = []
-                for sub in split_subs:
-                    if sub.index in translations:
-                        zh, emoji = translations[sub.index]
-                        content = f"{zh} {emoji}\n{sub.content}" if emoji else f"{zh}\n{sub.content}"
-                    else:
-                        content = sub.content
-                    bilingual_subs.append(srt.Subtitle(
-                        index=sub.index, start=sub.start, end=sub.end, content=content,
-                    ))
-
-                suffix = "_部分双语" if stopped else "_双语"
-                bi_path = base_path + suffix + ".srt"
-                with open(bi_path, "w", encoding="utf-8") as f:
-                    f.write(srt.compose(bilingual_subs))
-                if stopped:
-                    log(f"⏹ 已停止，部分双语字幕已保存（{len(translations)}/{len(split_subs)} 行）: {bi_path}")
-                else:
-                    log(f"✅ 双语字幕已保存: {bi_path}")
-
-        if stop_event and stop_event.is_set():
-            log("⏹ 任务已停止")
-        else:
-            log("🎉 全部完成！")
-
-    except Exception as e:
-        import traceback
-        log(f"❌ 错误: {e}")
-        log(traceback.format_exc())
-
-
-def query_video_info(url):
-    """
-    Returns (info_dict, error_str). Runs in background thread.
-    info_dict contains: title, uploader, duration, heights, manual_subs, auto_subs, has_ffmpeg
-    """
-    import shutil
-    try:
-        import yt_dlp
-    except ImportError:
-        return None, "未安装 yt-dlp，请运行: pip install yt-dlp"
-
-    has_ffmpeg = bool(shutil.which('ffmpeg'))
-    try:
-        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
-            raw = ydl.extract_info(url, download=False)
-    except Exception as e:
-        return None, _clean(str(e))
-
-    title = raw.get('title', 'video')
-    duration = raw.get('duration', 0) or 0
-    uploader = raw.get('uploader', '')
-
-    # Collect available video heights (from formats that carry video)
-    heights = sorted(
-        {f['height'] for f in raw.get('formats', [])
-         if f.get('vcodec', 'none') != 'none' and f.get('height')},
-        reverse=True
-    )
-
-    # Subtitles: {lang_code: {'name': str, 'type': 'manual'|'auto'}}
-    subs = {}
-    for lang, fmts in raw.get('subtitles', {}).items():
-        name = _LANG_NAMES.get(lang, lang)
-        if fmts and isinstance(fmts, list) and fmts[0].get('name'):
-            name = fmts[0]['name']
-        subs[lang] = {'name': name, 'type': 'manual'}
-    for lang, fmts in raw.get('automatic_captions', {}).items():
-        if lang not in subs:
-            name = _LANG_NAMES.get(lang, lang)
-            if fmts and isinstance(fmts, list) and fmts[0].get('name'):
-                name = fmts[0]['name']
-            subs[lang] = {'name': name, 'type': 'auto'}
-
-    return {
-        'title': title,
-        'uploader': uploader,
-        'duration': duration,
-        'heights': heights,
-        'subs': subs,
-        'has_ffmpeg': has_ffmpeg,
-    }, None
-
-
-def run_download(config, log):
-    """
-    config keys: url, save_dir, title, format_str, subtitle_langs, audio_only
-    subtitle_langs: list of lang codes, empty = no subtitles
-    """
-    try:
-        import yt_dlp
-    except ImportError:
-        log("❌ 未安装 yt-dlp，请运行: pip install yt-dlp")
-        return None
-
-    url = config['url']
-    save_dir = config['save_dir']
-    title = config['title']
-    format_str = config['format_str']
-    subtitle_langs = config.get('subtitle_langs', [])
-    audio_only = config.get('audio_only', False)
-    also_audio = config.get('also_audio', False)
-
-    try:
-        os.makedirs(save_dir, exist_ok=True)
-    except Exception as e:
-        log(f"❌ 无法创建目录: {e}")
-        return None
-
-    safe_title = re.sub(r'[\\/:*?"<>|]', '_', title).strip()[:40]
-    video_dir = os.path.join(save_dir, safe_title)
-    os.makedirs(video_dir, exist_ok=True)
-    log(f"📁 保存至: {video_dir}")
-
-    impersonate_target = None
-    if subtitle_langs:
-        try:
-            import curl_cffi  # noqa: F401
-            try:
-                from yt_dlp.networking.impersonate import ImpersonateTarget
-                impersonate_target = ImpersonateTarget('chrome')
-                log("🔒 已启用浏览器伪装（curl_cffi Chrome），有助于下载中文字幕")
-            except Exception:
-                pass
-        except ImportError:
-            log("⚠️  未安装 curl_cffi，中文字幕可能因 429 失败")
-            log("💡  一次性修复: pip install curl_cffi")
-
-    class YDLLogger:
-        def debug(self, msg):
-            # 过滤 [debug] 和 [download] 进度行（进度由 progress_hook 统一处理）
-            if msg.startswith('[debug]') or msg.startswith('[download]'):
-                return
-            log(_clean(msg))
-        def info(self, msg):
-            log(_clean(msg))
-        def warning(self, msg):
-            cleaned = _clean(msg)
-            log(f"⚠️ {cleaned}")
-            if 'impersonation' in cleaned:
-                log("💡 提示: 安装 curl_cffi 可修复中文字幕 429 问题 → pip install curl_cffi")
-        def error(self, msg):
-            log(f"❌ {_clean(msg)}")
-
-    last_pct = [""]
-
-    def progress_hook(d):
-        if d['status'] == 'downloading':
-            pct = _clean(d.get('_percent_str', '')).strip()
-            if pct and pct != last_pct[0]:
-                last_pct[0] = pct
-                speed = _clean(d.get('_speed_str', '')).strip()
-                eta = _clean(d.get('_eta_str', '')).strip()
-                log(f"⬇️ {pct}  速度: {speed}  剩余: {eta}")
-        elif d['status'] == 'finished':
-            log(f"✅ 完成: {os.path.basename(d.get('filename', ''))}")
-
-    postprocessors = []
-    if subtitle_langs:
-        postprocessors.append({'key': 'FFmpegSubtitlesConvertor', 'format': 'srt'})
-    if audio_only or also_audio:
-        postprocessors.append({'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'})
-
-    ydl_opts = {
-        'format': format_str,
-        'outtmpl': os.path.join(video_dir, '%(title)s.%(ext)s'),
-        'writesubtitles': bool(subtitle_langs),
-        'writeautomaticsub': bool(subtitle_langs),
-        'subtitleslangs': subtitle_langs if subtitle_langs else [],
-        'merge_output_format': 'mp4' if not audio_only else None,
-        'keepvideo': also_audio,
-        'postprocessors': postprocessors,
-        'progress_hooks': [progress_hook],
-        'logger': YDLLogger(),
-        'no_warnings': True,
-        'ignoreerrors': True,
-        'sleep_interval_subtitles': 2,
-        'retries': 5,
-    }
-    if impersonate_target is not None:
-        ydl_opts['impersonate'] = impersonate_target
-
-    log("⬇️ 开始下载...")
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-    except Exception as e:
-        err_str = _clean(str(e))
-        if 'Impersonate target' in str(e) and 'impersonate' in ydl_opts:
-            log("⚠️ 伪装目标不可用，改用普通模式重试...")
-            ydl_opts.pop('impersonate')
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-            except Exception as e2:
-                log(f"❌ 下载失败: {_clean(str(e2))}")
-                import traceback
-                log(traceback.format_exc())
-                return video_dir
-        else:
-            log(f"❌ 下载失败: {err_str}")
-            import traceback
-            log(traceback.format_exc())
-            return video_dir
-
-    all_files = os.listdir(video_dir)
-    video_exts = ('.mp4', '.mkv', '.webm', '.mp3', '.m4a', '.opus')
-    media_files = [f for f in all_files if os.path.splitext(f)[1].lower() in video_exts]
-    if media_files:
-        log(f"🎉 全部完成！文件保存至: {video_dir}")
-    else:
-        log("⚠️ 媒体文件未找到，字幕或其他文件可能已下载，请检查日志")
-    return video_dir
-
-
-# ── 格式选择弹窗 ──────────────────────────────────────────────────────────────
+# ── Gemini key list widget ────────────────────────────────────────────────────
+
+class GeminiKeyListWidget(tk.Frame):
+    """Masked list of Gemini API keys with add/delete buttons."""
+
+    def __init__(self, parent, threads_var, **kwargs):
+        super().__init__(parent, bg="#1e1e1e", **kwargs)
+        self._keys = []
+        self._threads_var = threads_var
+        self.columnconfigure(0, weight=1)
+        self._build()
+
+    @staticmethod
+    def _mask(key):
+        if len(key) <= 8:
+            return "•" * len(key)
+        return key[:4] + "•" * (len(key) - 8) + key[-4:]
+
+    def _build(self):
+        # Listbox row
+        f_list = tk.Frame(self, bg="#1e1e1e")
+        f_list.grid(row=0, column=0, sticky="ew")
+        f_list.columnconfigure(0, weight=1)
+
+        self._listbox = tk.Listbox(
+            f_list, bg="#2d2d2d", fg="#aaaaaa",
+            selectbackground="#0078d4", selectforeground="#ffffff",
+            relief="flat", font=("Consolas", 9), height=3,
+            activestyle="none", bd=4,
+        )
+        self._listbox.grid(row=0, column=0, sticky="ew", ipady=2)
+
+        sb = tk.Scrollbar(f_list, orient="vertical", command=self._listbox.yview,
+                          bg="#2d2d2d", troughcolor="#1e1e1e", width=10)
+        sb.grid(row=0, column=1, sticky="ns")
+        self._listbox.configure(yscrollcommand=sb.set)
+
+        # Button row
+        f_btn = tk.Frame(self, bg="#1e1e1e")
+        f_btn.grid(row=1, column=0, sticky="w", pady=(4, 0))
+
+        tk.Button(
+            f_btn, text="+ 添加密钥", command=self._add_key,
+            bg="#3a3a3a", fg="#cccccc", relief="flat", padx=10,
+            font=("Segoe UI", 9), cursor="hand2", activebackground="#4a4a4a",
+        ).pack(side="left")
+        tk.Button(
+            f_btn, text="删除选中", command=self._delete_selected,
+            bg="#3a3a3a", fg="#cccccc", relief="flat", padx=10,
+            font=("Segoe UI", 9), cursor="hand2", activebackground="#4a4a4a",
+        ).pack(side="left", padx=(8, 0))
+
+        # Threads row
+        f_threads = tk.Frame(self, bg="#1e1e1e")
+        f_threads.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        tk.Label(f_threads, text="线程数", bg="#1e1e1e", fg="#888888",
+                 font=("Segoe UI", 9)).pack(side="left")
+        tk.Entry(
+            f_threads, textvariable=self._threads_var, width=5,
+            bg="#2d2d2d", fg="#ffffff", insertbackground="white",
+            relief="flat", font=("Segoe UI", 10), bd=4,
+        ).pack(side="left", padx=(8, 0), ipady=3)
+
+    def _add_key(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("添加 Gemini API Key")
+        dlg.configure(bg="#1e1e1e")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="请输入 API Key：", bg="#1e1e1e", fg="#888888",
+                 font=("Segoe UI", 9)).pack(padx=24, pady=(18, 4), anchor="w")
+
+        key_var = tk.StringVar()
+        e = tk.Entry(
+            dlg, textvariable=key_var, show="•",
+            bg="#2d2d2d", fg="#ffffff", insertbackground="white",
+            relief="flat", font=("Segoe UI", 10), bd=4, width=42,
+        )
+        e.pack(padx=24, pady=(0, 4), ipady=5)
+        e.focus_set()
+
+        def confirm(*_):
+            key = key_var.get().strip()
+            if key and key not in self._keys:
+                self._keys.append(key)
+                self._listbox.insert("end", self._mask(key))
+            dlg.destroy()
+
+        e.bind("<Return>", confirm)
+
+        f_btn = tk.Frame(dlg, bg="#1e1e1e")
+        f_btn.pack(pady=14)
+        tk.Button(f_btn, text="取消", command=dlg.destroy,
+                  bg="#3a3a3a", fg="#cccccc", relief="flat", padx=18, pady=6,
+                  font=("Segoe UI", 9), cursor="hand2",
+                  activebackground="#4a4a4a").pack(side="left", padx=(0, 10))
+        tk.Button(f_btn, text="添加", command=confirm,
+                  bg="#0078d4", fg="#ffffff", relief="flat", padx=18, pady=6,
+                  font=("Segoe UI", 9, "bold"), cursor="hand2",
+                  activebackground="#005fa3").pack(side="left")
+
+        # Center over parent
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + self.winfo_width() // 2 - dlg.winfo_width() // 2
+        y = self.winfo_rooty() + self.winfo_height() // 2 - dlg.winfo_height() // 2
+        dlg.geometry(f"+{x}+{y}")
+
+    def _delete_selected(self):
+        sel = self._listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        self._listbox.delete(idx)
+        self._keys.pop(idx)
+
+    def get_keys(self):
+        return list(self._keys)
+
+    def set_keys(self, keys):
+        self._keys = list(keys)
+        self._listbox.delete(0, "end")
+        for k in self._keys:
+            self._listbox.insert("end", self._mask(k))
+
+
+# ── Format selection dialog ───────────────────────────────────────────────────
 
 class FormatDialog(tk.Toplevel):
-    """
-    Modal dialog that shows available resolutions and subtitles for a YouTube video.
-    Calls on_confirm(result_dict) when user confirms, destroys itself on cancel.
-    """
-
-    # Preferred language order for subtitle display
     _LANG_ORDER = ['en', 'zh-Hans', 'zh-Hant', 'zh', 'ja', 'ko', 'fr', 'de',
                    'es', 'ru', 'pt', 'ar', 'it']
 
@@ -761,7 +208,6 @@ class FormatDialog(tk.Toplevel):
         self._on_cancel = on_cancel
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._cancel)
-        # Center over parent, enforce max size before showing
         self.update_idletasks()
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
@@ -791,7 +237,6 @@ class FormatDialog(tk.Toplevel):
         info = self._info
         p = self
 
-        # ── 视频信息 ──
         title = info['title']
         short_title = title if len(title) <= 60 else title[:57] + "..."
         tk.Label(p, text=short_title, bg="#1e1e1e", fg="#ffffff",
@@ -800,18 +245,18 @@ class FormatDialog(tk.Toplevel):
                                   sticky="w", padx=16, pady=(14, 0))
 
         dur = info['duration']
-        meta = f"👤 {info['uploader']}   ⏱ {int(dur//60)}:{int(dur%60):02d}" if info['uploader'] else f"⏱ {int(dur//60)}:{int(dur%60):02d}"
+        meta = (f"👤 {info['uploader']}   ⏱ {int(dur//60)}:{int(dur%60):02d}"
+                if info['uploader'] else f"⏱ {int(dur//60)}:{int(dur%60):02d}")
         self._lbl(p, meta, "#666666", 9).grid(row=1, column=0, columnspan=2,
                                                sticky="w", padx=16, pady=(2, 4))
 
-        # ── ffmpeg 警告 ──
         if not info['has_ffmpeg']:
-            tk.Label(p, text="⚠️  未检测到 ffmpeg — 高分辨率视频需要 ffmpeg 才能合并音视频流。\n    建议安装 ffmpeg 后重试，或选择「仅音频」。",
+            tk.Label(p, text="⚠️  未检测到 ffmpeg — 高分辨率视频需要 ffmpeg 才能合并音视频流。\n"
+                             "    建议安装 ffmpeg 后重试，或选择「仅音频」。",
                      bg="#2a1f00", fg="#ffcc44", font=("Segoe UI", 9),
                      justify="left", anchor="w", padx=10, pady=6
                      ).grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(4, 0))
 
-        # ── 下载类型 ──
         self._section(p, 3, "  下 载 内 容")
         f_type = tk.Frame(p, bg="#1e1e1e")
         f_type.grid(row=5, column=0, columnspan=2, sticky="w", padx=24, pady=(0, 4))
@@ -826,7 +271,6 @@ class FormatDialog(tk.Toplevel):
                        activebackground="#1e1e1e", font=("Segoe UI", 10)
                        ).pack(side="left")
 
-        # ── 分辨率 ──
         self._section(p, 6, "  分 辨 率  （视频+音频时可用）")
         self._height_var = tk.StringVar(value="best")
         self._height_frame = tk.Frame(p, bg="#1e1e1e")
@@ -848,7 +292,6 @@ class FormatDialog(tk.Toplevel):
         if not heights:
             self._lbl(self._height_frame, "（无可用视频流）", "#555555").pack(side="left")
 
-        # ── 字幕 ──
         self._section(p, 9, "  字 幕")
         subs = info['subs']
 
@@ -863,13 +306,10 @@ class FormatDialog(tk.Toplevel):
         if not subs:
             self._lbl(f_sub_header, "  （该视频没有字幕）", "#555555").pack(side="left")
 
-        # Build subtitle checkboxes in a scrollable-ish frame (canvas + frame for many subs)
         sub_outer = tk.Frame(p, bg="#1e1e1e")
         sub_outer.grid(row=12, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 4))
 
-        self._sub_vars = {}  # lang_code -> BooleanVar
-
-        # Only show Chinese and English subtitle options
+        self._sub_vars = {}
         _SHOW_LANGS = {'en', 'zh', 'zh-Hans', 'zh-Hant'}
         _ORDER = ['en', 'zh-Hans', 'zh-Hant', 'zh']
         filtered = {k: v for k, v in subs.items() if k in _SHOW_LANGS}
@@ -896,7 +336,6 @@ class FormatDialog(tk.Toplevel):
             tk.Label(row_f, text=type_tag, bg="#1e1e1e", fg=type_color,
                      font=("Segoe UI", 8)).pack(side="left", padx=(2, 0))
 
-        # ── 按钮 ──
         sep = tk.Frame(p, bg="#333333", height=1)
         sep.grid(row=13, column=0, columnspan=2, sticky="ew", padx=16, pady=(10, 0))
         f_btn = tk.Frame(p, bg="#1e1e1e")
@@ -961,7 +400,7 @@ class FormatDialog(tk.Toplevel):
         self._on_cancel()
 
 
-# ── 主窗口 ────────────────────────────────────────────────────────────────────
+# ── Main application ──────────────────────────────────────────────────────────
 
 class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def __init__(self):
@@ -974,6 +413,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._dl_log_queue = queue.Queue()
         self._is_running = False
         self._dl_is_running = False
+        self._tweet_is_running = False
         self._last_dl_dir = ""
         self._stop_event = None
         self._saved_config = load_config()
@@ -982,16 +422,49 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._poll_log()
         self._poll_dl_log()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(150, lambda: _apply_dark_titlebar(self))
 
     def _apply_style(self):
         style = ttk.Style(self)
         style.theme_use('default')
+
+        # Notebook tabs
         style.configure('TNotebook', background='#1e1e1e', borderwidth=0)
         style.configure('TNotebook.Tab', background='#2a2a2a', foreground='#888888',
                         padding=[16, 6], font=('Segoe UI', 9))
         style.map('TNotebook.Tab',
                   background=[('selected', '#1e1e1e')],
                   foreground=[('selected', '#ffffff')])
+
+        # Dark combobox — entry field + arrow button
+        style.configure('TCombobox',
+                        fieldbackground='#2d2d2d',
+                        background='#3a3a3a',
+                        foreground='#cccccc',
+                        arrowcolor='#777777',
+                        selectbackground='#0a5a9a',
+                        selectforeground='#ffffff',
+                        insertcolor='#ffffff')
+        style.map('TCombobox',
+                  fieldbackground=[('readonly', '#2d2d2d'), ('disabled', '#1a1a1a')],
+                  foreground=[('readonly', '#cccccc'), ('disabled', '#555555')],
+                  background=[('active', '#484848'), ('pressed', '#383838')])
+
+        # Dark dropdown popup (Listbox + Scrollbar created by Tk internally)
+        self.option_add('*TCombobox*Listbox.background', '#252525')
+        self.option_add('*TCombobox*Listbox.foreground', '#c8c8c8')
+        self.option_add('*TCombobox*Listbox.selectBackground', '#0a5a9a')
+        self.option_add('*TCombobox*Listbox.selectForeground', '#ffffff')
+        self.option_add('*TCombobox*Listbox.relief', 'flat')
+        self.option_add('*TCombobox*Listbox.borderWidth', '0')
+        # Narrow, dark scrollbar inside the dropdown
+        self.option_add('*TCombobox*Scrollbar.width', 8)
+        self.option_add('*TCombobox*Scrollbar.background', '#3c3c3c')
+        self.option_add('*TCombobox*Scrollbar.activeBackground', '#505050')
+        self.option_add('*TCombobox*Scrollbar.troughColor', '#1a1a1a')
+        self.option_add('*TCombobox*Scrollbar.relief', 'flat')
+        self.option_add('*TCombobox*Scrollbar.borderWidth', '0')
+        self.option_add('*TCombobox*Scrollbar.elementBorderWidth', '0')
 
     def _on_close(self):
         if self._is_running or self._dl_is_running:
@@ -1015,6 +488,13 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         else:
             if cur and cur not in DEFAULT_MODELS_GEMINI and cur not in gemini_custom:
                 gemini_custom.append(cur)
+
+        tweet_prompts = []
+        for i in range(3):
+            name = self._tweet_prompt_name_vars[i].get().strip() or f"场景 {i+1}"
+            text = self._tweet_prompt_texts[i].get("1.0", "end").strip()
+            tweet_prompts.append({"name": name, "text": text})
+
         save_config({
             "model_path": self.model_var.get().strip(),
             "device": self.device_var.get(),
@@ -1024,18 +504,28 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "initial_prompt": self.prompt_var.get(),
             "provider": provider,
             "api_key": self.sf_key_var.get().strip(),
-            "translate_model": self.trans_model_var.get().strip() if provider == "siliconflow" else self._saved_config.get("translate_model", DEFAULT_MODELS_SF[0]),
+            "translate_model": (self.trans_model_var.get().strip()
+                                if provider == "siliconflow"
+                                else self._saved_config.get("translate_model", DEFAULT_MODELS_SF[0])),
             "custom_models": sf_custom,
             "ark_api_key": self.ark_key_var.get().strip(),
-            "ark_model": self.trans_model_var.get().strip() if provider == "volcengine" else self._saved_config.get("ark_model", DEFAULT_MODELS_ARK[0]),
+            "ark_model": (self.trans_model_var.get().strip()
+                          if provider == "volcengine"
+                          else self._saved_config.get("ark_model", DEFAULT_MODELS_ARK[0])),
             "ark_custom_models": ark_custom,
-            "gemini_api_keys": self._gemini_key_text.get("1.0", "end").strip(),
-            "gemini_model": self.trans_model_var.get().strip() if provider == "gemini" else self._saved_config.get("gemini_model", DEFAULT_MODELS_GEMINI[0]),
+            "gemini_api_keys": self._gemini_key_widget.get_keys(),
+            "gemini_model": (self.trans_model_var.get().strip()
+                             if provider == "gemini"
+                             else self._saved_config.get("gemini_model", DEFAULT_MODELS_GEMINI[0])),
             "gemini_custom_models": gemini_custom,
             "gemini_threads": self.gemini_threads_var.get().strip(),
             "translate_enabled": self.translate_var.get(),
             "batch_size": self.batch_var.get().strip(),
             "download_dir": self.dl_dir_var.get().strip(),
+            "tweet_provider": self.tweet_provider_var.get(),
+            "tweet_model": self.tweet_model_var.get().strip(),
+            "tweet_prompts": tweet_prompts,
+            "tweet_font_size": self._tweet_font_size.get(),
         })
 
     def _poll_log(self):
@@ -1083,6 +573,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                       activebackground="#4a4a4a").grid(row=0, column=1, padx=(6, 0))
         return e
 
+    # ── Build ─────────────────────────────────────────────────────────────────
+
     def _build(self):
         cfg = self._saved_config
         self.columnconfigure(0, weight=1)
@@ -1093,13 +585,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         tab_t = tk.Frame(nb, bg="#1e1e1e")
         tab_d = tk.Frame(nb, bg="#1e1e1e")
-        tab_t.columnconfigure(0, weight=1)
-        tab_d.columnconfigure(0, weight=1)
+        tab_w = tk.Frame(nb, bg="#1e1e1e")
+        for tab in (tab_t, tab_d, tab_w):
+            tab.columnconfigure(0, weight=1)
         nb.add(tab_t, text="  转 写  ")
         nb.add(tab_d, text="  下 载  ")
+        nb.add(tab_w, text="  推 文  ")
 
         self._build_transcribe(tab_t, cfg)
         self._build_download(tab_d, cfg)
+        self._build_tweet(tab_w, cfg)
+
+    # ── Transcribe tab ────────────────────────────────────────────────────────
 
     def _build_transcribe(self, p, cfg):
         tk.Label(p, text="  转 写", bg="#1e1e1e", fg="#555555",
@@ -1141,11 +638,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         f_opts = tk.Frame(p, bg="#1e1e1e")
         f_opts.grid(row=9, column=0, sticky="ew", padx=16, pady=8)
 
-        def olbl(t): tk.Label(f_opts, text=t, bg="#1e1e1e", fg="#888888",
-                               font=("Segoe UI", 9)).pack(side="left")
+        def olbl(t):
+            tk.Label(f_opts, text=t, bg="#1e1e1e", fg="#888888",
+                     font=("Segoe UI", 9)).pack(side="left")
+
         def ocombo(var, vals, w):
             ttk.Combobox(f_opts, textvariable=var, values=vals, width=w,
                          state="readonly").pack(side="left", padx=(4, 14))
+
         def oentry(var, w):
             tk.Entry(f_opts, textvariable=var, width=w, bg="#2d2d2d", fg="#ffffff",
                      insertbackground="white", relief="flat", font=("Segoe UI", 10),
@@ -1170,8 +670,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  insertbackground="white", relief="flat", font=("Segoe UI", 10), bd=4
                  ).grid(row=11, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
 
-        sep = tk.Frame(p, bg="#333333", height=1)
-        sep.grid(row=12, column=0, sticky="ew", padx=16, pady=(8, 0))
+        tk.Frame(p, bg="#333333", height=1).grid(row=12, column=0, sticky="ew", padx=16, pady=(8, 0))
 
         f_trans_title = tk.Frame(p, bg="#1e1e1e")
         f_trans_title.grid(row=13, column=0, sticky="ew", padx=16, pady=(6, 0))
@@ -1195,41 +694,33 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                            command=self._on_provider_change
                            ).pack(side="left", padx=(12, 0))
 
+        # SF key
         self._sf_key_lbl = self._lbl(p, "硅基流动 API Key")
         self._sf_key_lbl.grid(row=15, column=0, sticky="w", padx=16, pady=(6, 0))
         self.sf_key_var = tk.StringVar(value=cfg.get("api_key", ""))
         self._sf_key_entry = tk.Entry(p, textvariable=self.sf_key_var, bg="#2d2d2d", fg="#ffffff",
                                       insertbackground="white", relief="flat",
-                                      font=("Segoe UI", 10), bd=4, show="*")
+                                      font=("Segoe UI", 10), bd=4, show="•")
         self._sf_key_entry.grid(row=16, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
 
+        # ARK key
         self._ark_key_lbl = self._lbl(p, "火山引擎 ARK API Key")
         self._ark_key_lbl.grid(row=15, column=0, sticky="w", padx=16, pady=(6, 0))
         self.ark_key_var = tk.StringVar(value=cfg.get("ark_api_key", ""))
         self._ark_key_entry = tk.Entry(p, textvariable=self.ark_key_var, bg="#2d2d2d", fg="#ffffff",
                                        insertbackground="white", relief="flat",
-                                       font=("Segoe UI", 10), bd=4, show="*")
+                                       font=("Segoe UI", 10), bd=4, show="•")
         self._ark_key_entry.grid(row=16, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
 
-        self._gemini_key_lbl = self._lbl(p, "Google Gemini API Key（每行一个，多个 Key 自动轮询）")
+        # Gemini key widget
+        self._gemini_key_lbl = self._lbl(p, "Google Gemini API Key（每个 Key 一行，多 Key 自动轮询）")
         self._gemini_key_lbl.grid(row=15, column=0, sticky="w", padx=16, pady=(6, 0))
-        # Container: Text + threads row, all in column=0
-        self._gemini_key_frame = tk.Frame(p, bg="#1e1e1e")
-        self._gemini_key_frame.grid(row=16, column=0, sticky="ew", padx=16, pady=(2, 4))
-        self._gemini_key_frame.columnconfigure(0, weight=1)
-        self._gemini_key_text = tk.Text(self._gemini_key_frame, bg="#2d2d2d", fg="#ffffff",
-                                        insertbackground="white", relief="flat",
-                                        font=("Segoe UI", 10), bd=4, height=3)
-        self._gemini_key_text.insert("1.0", cfg.get("gemini_api_keys", ""))
-        self._gemini_key_text.grid(row=0, column=0, columnspan=2, sticky="ew")
-        tk.Label(self._gemini_key_frame, text="线程数", bg="#1e1e1e", fg="#888888",
-                 font=("Segoe UI", 9)).grid(row=1, column=0, sticky="w", pady=(5, 0))
         self.gemini_threads_var = tk.StringVar(value=cfg.get("gemini_threads", "1"))
-        tk.Entry(self._gemini_key_frame, textvariable=self.gemini_threads_var, width=5,
-                 bg="#2d2d2d", fg="#ffffff", insertbackground="white", relief="flat",
-                 font=("Segoe UI", 10), bd=4).grid(row=1, column=1, sticky="w",
-                                                    padx=(8, 0), pady=(5, 0), ipady=3)
+        self._gemini_key_widget = GeminiKeyListWidget(p, self.gemini_threads_var)
+        self._gemini_key_widget.grid(row=16, column=0, sticky="ew", padx=16, pady=(2, 4))
+        self._gemini_key_widget.set_keys(cfg.get("gemini_api_keys", []))
 
+        # Model combo
         self._lbl(p, "翻译模型（可手动输入新模型后回车保存）").grid(
             row=17, column=0, sticky="w", padx=16, pady=(2, 0))
         self.trans_model_var = tk.StringVar()
@@ -1268,16 +759,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         self._on_provider_change()
 
+    # ── Download tab ──────────────────────────────────────────────────────────
+
     def _build_download(self, p, cfg):
         p.columnconfigure(0, weight=1)
         p.rowconfigure(6, weight=1)
 
-        # ── 区域标题 ──
         tk.Label(p, text="  下 载", bg="#1e1e1e", fg="#555555",
                  font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w",
                                             padx=16, pady=(12, 0))
 
-        # ── 保存目录（含浏览按钮） ──
         self._lbl(p, "视频保存目录（每个视频自动创建独立子文件夹）").grid(
             row=1, column=0, sticky="w", padx=16, pady=(8, 0))
         f_dir = tk.Frame(p, bg="#1e1e1e")
@@ -1292,7 +783,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                   font=("Segoe UI", 9), cursor="hand2",
                   activebackground="#4a4a4a").grid(row=0, column=1, padx=(6, 0))
 
-        # ── 视频链接 ──
         self._lbl(p, "视频链接（支持 YouTube、X/Twitter、B站等）").grid(
             row=3, column=0, sticky="w", padx=16, pady=(10, 0))
         self.dl_url_var = tk.StringVar()
@@ -1301,7 +791,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  font=("Segoe UI", 10), bd=4).grid(
             row=4, column=0, sticky="ew", padx=16, pady=(2, 0), ipady=4)
 
-        # ── 操作按钮 ──
         f_btn = tk.Frame(p, bg="#1e1e1e")
         f_btn.grid(row=5, column=0, pady=14)
         self.dl_btn = tk.Button(
@@ -1316,13 +805,177 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             font=("Segoe UI", 10), padx=20, pady=7,
             cursor="hand2", activebackground="#4a4a4a").pack(side="left", padx=(10, 0))
 
-        # ── 日志 ──
         self.dl_log_box = scrolledtext.ScrolledText(
             p, bg="#111111", fg="#cccccc", font=("Consolas", 9),
             relief="flat", state="disabled", height=10)
         self.dl_log_box.grid(row=6, column=0, sticky="nsew", padx=16, pady=(0, 16))
 
-    # ── 转写标签页事件 ──────────────────────────────────────────────────────────
+    # ── Tweet tab ─────────────────────────────────────────────────────────────
+
+    def _build_tweet(self, p, cfg):
+        p.columnconfigure(0, weight=1)
+        p.rowconfigure(0, weight=1)
+
+        fs = cfg.get("tweet_font_size", 11)
+        self._tweet_font_size = tk.IntVar(value=fs)
+
+        prompts = cfg.get("tweet_prompts", DEFAULT_CONFIG["tweet_prompts"])
+
+        # PanedWindow: top = prompt config (draggable), bottom = chat
+        pw = tk.PanedWindow(p, orient=tk.VERTICAL,
+                            sashwidth=5, sashpad=0, sashrelief="flat",
+                            sashcursor="sb_v_double_arrow",
+                            bg="#252525", bd=0, relief="flat")
+        pw.grid(row=0, column=0, sticky="nsew")
+
+        # ── Top pane: Prompt config ──
+        top = tk.Frame(pw, bg="#1e1e1e")
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(1, weight=1)
+
+        tk.Label(top, text="  提示词配置", bg="#1e1e1e", fg="#444444",
+                 font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w", padx=16, pady=(10, 0))
+
+        pnb = ttk.Notebook(top)
+        pnb.grid(row=1, column=0, sticky="nsew", padx=16, pady=(4, 10))
+        self._tweet_prompt_nb = pnb
+        self._tweet_prompt_name_vars = []
+        self._tweet_prompt_texts = []
+
+        for i, pd in enumerate(prompts):
+            tab = tk.Frame(pnb, bg="#161616")
+            tab.columnconfigure(1, weight=1)
+            tab.rowconfigure(1, weight=1)
+            pnb.add(tab, text=f"  {pd['name']}  ")
+
+            tk.Label(tab, text="名称", bg="#161616", fg="#555555",
+                     font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w",
+                                                 padx=(14, 6), pady=(10, 6))
+            name_var = tk.StringVar(value=pd["name"])
+            self._tweet_prompt_name_vars.append(name_var)
+            tk.Entry(tab, textvariable=name_var, bg="#222222", fg="#bbbbbb",
+                     insertbackground="#888888", relief="flat",
+                     font=("Segoe UI", 10), bd=3, highlightthickness=0).grid(
+                row=0, column=1, sticky="ew", padx=(0, 14), pady=(10, 6), ipady=4)
+
+            pt = tk.Text(tab, bg="#111111", fg="#cccccc", insertbackground="#888888",
+                         relief="flat", font=("Segoe UI", 10), bd=0,
+                         wrap="word", padx=12, pady=10, height=4,
+                         selectbackground="#1e3a5a", highlightthickness=0)
+            pt.insert("1.0", pd["text"])
+            pt.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=14, pady=(0, 0))
+            self._tweet_prompt_texts.append(pt)
+
+            idx = i
+            tk.Button(tab, text="保 存", command=lambda i=idx: self._save_tweet_prompt(i),
+                      bg="#161616", fg="#505050", relief="flat", padx=14, pady=5,
+                      font=("Segoe UI", 9), cursor="hand2",
+                      activebackground="#242424", activeforeground="#aaaaaa",
+                      bd=0).grid(row=2, column=1, sticky="e", padx=(0, 14), pady=(6, 10))
+
+        pw.add(top, minsize=60, stretch="never")
+
+        # ── Bottom pane: Chat ──
+        bottom = tk.Frame(pw, bg="#1e1e1e")
+        bottom.columnconfigure(0, weight=1)
+        bottom.rowconfigure(1, weight=1)
+
+        # Chat header row
+        f_hdr = tk.Frame(bottom, bg="#1e1e1e")
+        f_hdr.grid(row=0, column=0, sticky="ew", padx=16, pady=(10, 0))
+
+        # Provider radios
+        self.tweet_provider_var = tk.StringVar(value=cfg.get("tweet_provider", "gemini"))
+        for val, txt in [("gemini", "Gemini"), ("siliconflow", "硅基"), ("volcengine", "ARK")]:
+            tk.Radiobutton(f_hdr, text=txt, variable=self.tweet_provider_var, value=val,
+                           bg="#1e1e1e", fg="#666666", selectcolor="#1e1e1e",
+                           activebackground="#1e1e1e", activeforeground="#aaaaaa",
+                           font=("Segoe UI", 9),
+                           command=self._on_tweet_provider_change).pack(side="left", padx=(0, 2))
+
+        self.tweet_model_var = tk.StringVar(value=cfg.get("tweet_model", DEFAULT_MODELS_GEMINI[0]))
+        self.tweet_model_combo = ttk.Combobox(f_hdr, textvariable=self.tweet_model_var,
+                                               font=("Segoe UI", 9), width=20)
+        self.tweet_model_combo.pack(side="left", padx=(8, 0))
+
+        # Right side: font controls + new conversation
+        f_right = tk.Frame(f_hdr, bg="#1e1e1e")
+        f_right.pack(side="right")
+
+        _bkw = dict(bg="#1e1e1e", relief="flat", font=("Segoe UI", 9), cursor="hand2",
+                    activebackground="#252525", bd=0, padx=4, pady=2)
+        tk.Button(f_right, text="A−", fg="#484848",
+                  command=lambda: self._update_tweet_font(-1), **_bkw).pack(side="left")
+        tk.Label(f_right, textvariable=self._tweet_font_size, bg="#1e1e1e", fg="#3e3e3e",
+                 font=("Segoe UI", 9), width=2, anchor="center").pack(side="left")
+        tk.Button(f_right, text="A+", fg="#484848",
+                  command=lambda: self._update_tweet_font(1), **_bkw).pack(side="left")
+        # "新对话" moved to send row
+
+        # Chat display: tk.Text + thin dark native scrollbar
+        f_chat = tk.Frame(bottom, bg="#0c0c0c",
+                          highlightbackground="#1e1e1e", highlightthickness=1)
+        f_chat.grid(row=1, column=0, sticky="nsew", padx=16, pady=(8, 0))
+        f_chat.columnconfigure(0, weight=1)
+        f_chat.rowconfigure(0, weight=1)
+
+        self._tweet_chat = tk.Text(
+            f_chat, bg="#0c0c0c", fg="#d8d8d8",
+            insertbackground="white", relief="flat", font=("Segoe UI", fs), bd=0,
+            wrap="word", padx=16, pady=14, spacing1=1, spacing3=1,
+            selectbackground="#1e3a5a", selectforeground="#ffffff",
+            cursor="arrow", highlightthickness=0)
+        self._tweet_chat.grid(row=0, column=0, sticky="nsew")
+        self._tweet_chat.configure(state="disabled")
+
+        # Thin 7px dark scrollbar
+        chat_sb = tk.Scrollbar(
+            f_chat, orient="vertical", command=self._tweet_chat.yview,
+            bg="#282828", activebackground="#383838", troughcolor="#0c0c0c",
+            relief="flat", bd=0, width=7, elementborderwidth=0, highlightthickness=0)
+        chat_sb.grid(row=0, column=1, sticky="ns")
+        self._tweet_chat.configure(yscrollcommand=chat_sb.set)
+        self._apply_tweet_tags()
+
+        # Input box with subtle border
+        f_input_wrap = tk.Frame(bottom, bg="#1a1a1a",
+                                highlightbackground="#2a2a2a", highlightthickness=1)
+        f_input_wrap.grid(row=2, column=0, sticky="ew", padx=16, pady=(10, 0))
+        f_input_wrap.columnconfigure(0, weight=1)
+
+        self._tweet_input = tk.Text(
+            f_input_wrap, bg="#141414", fg="#d0d0d0",
+            insertbackground="#7a7a7a", relief="flat", font=("Segoe UI", 10),
+            bd=0, height=4, wrap="word", padx=14, pady=10, highlightthickness=0)
+        self._tweet_input.grid(row=0, column=0, sticky="ew")
+        # Enter = send, Ctrl+Enter = newline
+        self._tweet_input.bind("<Return>",
+                                lambda e: (self._send_tweet(), "break")[-1])
+        self._tweet_input.bind("<Control-Return>",
+                                lambda e: (self._tweet_input.insert("insert", "\n"), "break")[-1])
+
+        # Send row: right-aligned  [新对话]  [发 送]
+        f_send = tk.Frame(bottom, bg="#1e1e1e")
+        f_send.grid(row=3, column=0, sticky="e", padx=16, pady=(8, 14))
+        tk.Button(f_send, text="新对话", command=self._new_tweet_conversation,
+                  bg="#1e1e1e", fg="#555555", relief="flat", padx=14, pady=7,
+                  font=("Segoe UI", 9), cursor="hand2",
+                  activebackground="#252525", activeforeground="#999999",
+                  bd=0).pack(side="left", padx=(0, 8))
+        self.tweet_send_btn = tk.Button(
+            f_send, text="发 送", command=self._send_tweet,
+            bg="#0a6dd4", fg="#ffffff", relief="flat", padx=28, pady=7,
+            font=("Segoe UI", 10, "bold"), cursor="hand2",
+            activebackground="#0060bb", bd=0)
+        self.tweet_send_btn.pack(side="left")
+
+        pw.add(bottom, minsize=220, stretch="always")
+
+        # Init
+        self._tweet_history = []
+        self._on_tweet_provider_change()
+
+    # ── Transcribe tab events ─────────────────────────────────────────────────
 
     def _on_provider_change(self):
         provider = self.provider_var.get()
@@ -1332,7 +985,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._ark_key_lbl.grid_remove()
         self._ark_key_entry.grid_remove()
         self._gemini_key_lbl.grid_remove()
-        self._gemini_key_frame.grid_remove()
+        self._gemini_key_widget.grid_remove()
         if provider == "siliconflow":
             self._sf_key_lbl.grid()
             self._sf_key_entry.grid()
@@ -1345,7 +998,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             saved_model = cfg.get("ark_model", DEFAULT_MODELS_ARK[0])
         else:
             self._gemini_key_lbl.grid()
-            self._gemini_key_frame.grid()
+            self._gemini_key_widget.grid()
             models = DEFAULT_MODELS_GEMINI + cfg.get("gemini_custom_models", [])
             saved_model = cfg.get("gemini_model", DEFAULT_MODELS_GEMINI[0])
         self.trans_combo["values"] = models
@@ -1360,7 +1013,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             current.append(val)
             self.trans_combo["values"] = current
             cfg = self._saved_config
-            key = {"siliconflow": "custom_models", "volcengine": "ark_custom_models"}.get(self.provider_var.get(), "gemini_custom_models")
+            key = {"siliconflow": "custom_models", "volcengine": "ark_custom_models"}.get(
+                self.provider_var.get(), "gemini_custom_models")
             custom = cfg.get(key, [])
             if val not in custom:
                 custom.append(val)
@@ -1447,7 +1101,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "provider": provider,
             "api_key": self.sf_key_var.get().strip(),
             "ark_api_key": self.ark_key_var.get().strip(),
-            "gemini_api_keys": self._gemini_key_text.get("1.0", "end").strip(),
+            "gemini_api_keys": self._gemini_key_widget.get_keys(),
             "gemini_threads": self.gemini_threads_var.get().strip(),
             "translate_model": self.trans_model_var.get().strip() if provider == "siliconflow" else "",
             "ark_model": self.trans_model_var.get().strip() if provider == "volcengine" else "",
@@ -1478,7 +1132,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             self._stop_event.set()
         self.stop_btn.configure(state="disabled", text="停止中...")
 
-    # ── 下载标签页事件 ──────────────────────────────────────────────────────────
+    # ── Download tab events ───────────────────────────────────────────────────
 
     def _browse_dl_dir(self):
         path = filedialog.askdirectory(title="选择视频保存目录")
@@ -1558,7 +1212,6 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     def _begin_download(self, url, save_dir, title, fmt_opts):
         self.dl_btn.configure(state="disabled", text="下载中...")
-        # Pre-set the video subfolder path so the button works immediately
         _safe = re.sub(r'[\\/:*?"<>|]', '_', title).strip()[:40]
         self._last_dl_dir = os.path.normpath(os.path.join(save_dir, _safe))
 
@@ -1592,6 +1245,129 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
         threading.Thread(target=task, daemon=True).start()
 
+    # ── Tweet tab events ──────────────────────────────────────────────────────
+
+    def _apply_tweet_tags(self):
+        fs = self._tweet_font_size.get()
+        f = "Segoe UI"
+        self._tweet_chat.tag_configure(
+            "user_hdr", foreground="#4a9fd4",
+            font=(f, fs - 1, "bold"), spacing1=16, spacing3=3)
+        self._tweet_chat.tag_configure(
+            "ai_hdr", foreground="#5aaa5a",
+            font=(f, fs - 1, "bold"), spacing1=16, spacing3=3)
+        self._tweet_chat.tag_configure(
+            "user_text", foreground="#c0d8e8",
+            font=(f, fs), spacing3=4, lmargin1=4, lmargin2=4)
+        self._tweet_chat.tag_configure(
+            "ai_text", foreground="#dedede",
+            font=(f, fs), spacing3=4, lmargin1=4, lmargin2=4)
+        self._tweet_chat.tag_configure(
+            "err_text", foreground="#d05050",
+            font=(f, fs), spacing3=4)
+        self._tweet_chat.tag_configure(
+            "sep", foreground="#1e1e1e",
+            font=(f, 6), spacing1=4, spacing3=10)
+
+    def _update_tweet_font(self, delta):
+        cur = self._tweet_font_size.get()
+        new = max(8, min(24, cur + delta))
+        if new == cur:
+            return
+        self._tweet_font_size.set(new)
+        self._tweet_chat.configure(font=("Segoe UI", new))
+        self._apply_tweet_tags()
+
+    def _on_tweet_provider_change(self):
+        provider = self.tweet_provider_var.get()
+        cfg = self._saved_config
+        if provider == "gemini":
+            models = DEFAULT_MODELS_GEMINI + cfg.get("gemini_custom_models", [])
+        elif provider == "siliconflow":
+            models = DEFAULT_MODELS_SF + cfg.get("custom_models", [])
+        else:
+            models = DEFAULT_MODELS_ARK + cfg.get("ark_custom_models", [])
+        self.tweet_model_combo["values"] = models
+        cur = self.tweet_model_var.get()
+        if cur not in models:
+            self.tweet_model_var.set(models[0])
+
+    def _save_tweet_prompt(self, idx):
+        name = self._tweet_prompt_name_vars[idx].get().strip() or f"场景 {idx+1}"
+        text = self._tweet_prompt_texts[idx].get("1.0", "end").strip()
+        prompts = self._saved_config.get("tweet_prompts", DEFAULT_CONFIG["tweet_prompts"])
+        prompts[idx] = {"name": name, "text": text}
+        self._saved_config["tweet_prompts"] = prompts
+        self._tweet_prompt_nb.tab(idx, text=f"  {name}  ")
+        self._do_save_config()
+
+    def _new_tweet_conversation(self):
+        self._tweet_history = []
+        self._tweet_chat.configure(state="normal")
+        self._tweet_chat.delete("1.0", "end")
+        self._tweet_chat.configure(state="disabled")
+
+    def _get_tweet_api_key(self):
+        provider = self.tweet_provider_var.get()
+        if provider == "gemini":
+            return self._gemini_key_widget.get_keys()
+        elif provider == "siliconflow":
+            return self.sf_key_var.get().strip()
+        else:
+            return self.ark_key_var.get().strip()
+
+    def _get_tweet_system_prompt(self):
+        try:
+            idx = self._tweet_prompt_nb.index("current")
+            return self._tweet_prompt_texts[idx].get("1.0", "end").strip()
+        except Exception:
+            return ""
+
+    def _append_tweet(self, text, tag):
+        self._tweet_chat.configure(state="normal")
+        self._tweet_chat.insert("end", text, tag)
+        self._tweet_chat.see("end")
+        self._tweet_chat.configure(state="disabled")
+
+    def _send_tweet(self):
+        if self._tweet_is_running:
+            return
+        msg = self._tweet_input.get("1.0", "end").strip()
+        if not msg:
+            return
+        self._tweet_input.delete("1.0", "end")
+
+        self._tweet_history.append({"role": "user", "content": msg})
+        self._append_tweet("你\n", "user_hdr")
+        self._append_tweet(msg + "\n", "user_text")
+
+        provider = self.tweet_provider_var.get()
+        model = self.tweet_model_var.get()
+        api_key = self._get_tweet_api_key()
+        system_prompt = self._get_tweet_system_prompt()
+        history = list(self._tweet_history)
+
+        self._tweet_is_running = True
+        self.tweet_send_btn.configure(state="disabled", text="···")
+        self._append_tweet("AI\n", "ai_hdr")
+
+        def task():
+            reply, err = chat_completion(history, system_prompt, provider, api_key, model)
+            if err:
+                self.after(0, lambda: self._append_tweet(f"❌ {err}\n", "err_text"))
+            else:
+                self._tweet_history.append({"role": "assistant", "content": reply})
+                r = reply
+                self.after(0, lambda: self._append_tweet(r + "\n", "ai_text"))
+            sep = "─" * 52 + "\n"
+            self.after(0, lambda: self._append_tweet(sep, "sep"))
+            self._tweet_is_running = False
+            self.after(0, lambda: self.tweet_send_btn.configure(state="normal", text="发 送"))
+
+        threading.Thread(target=task, daemon=True).start()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     app = App()
