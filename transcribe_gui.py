@@ -1,6 +1,6 @@
 """
 faster-whisper 字幕生成 + 双语翻译工具
-依赖: pip install faster-whisper srt_equalizer srt tkinterdnd2 requests
+依赖: pip install faster-whisper srt_equalizer srt tkinterdnd2 requests yt-dlp
 """
 
 import os
@@ -71,6 +71,21 @@ DEFAULT_CONFIG = {
     "ark_custom_models": [],
     "translate_enabled": False,
     "batch_size": "15",
+    "download_dir": "",
+}
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
+
+def _clean(msg):
+    return _ANSI_RE.sub('', str(msg))
+
+# Common language code → display name
+_LANG_NAMES = {
+    'en': '英语', 'zh': '中文', 'zh-Hans': '中文（简体）', 'zh-Hant': '中文（繁体）',
+    'ja': '日语', 'ko': '韩语', 'fr': '法语', 'de': '德语', 'es': '西班牙语',
+    'ru': '俄语', 'ar': '阿拉伯语', 'pt': '葡萄牙语', 'it': '意大利语',
+    'nl': '荷兰语', 'pl': '波兰语', 'tr': '土耳其语', 'vi': '越南语',
+    'th': '泰语', 'id': '印尼语', 'hi': '印地语',
 }
 
 
@@ -96,7 +111,6 @@ def save_config(cfg):
 
 
 def _parse_translation(content):
-    """解析翻译响应，返回 {index: (zh, emoji)} 字典"""
     parsed = {}
     for line in content.split("\n"):
         line = line.strip()
@@ -121,7 +135,6 @@ def _parse_translation(content):
 
 
 def translate_batch(subs_batch, api_key, model, log):
-    """硅基流动翻译，返回 {index: (zh, emoji)} 字典"""
     import urllib.request
 
     lines = [f"{sub.index}. {sub.content}" for sub in subs_batch]
@@ -171,7 +184,6 @@ def translate_batch(subs_batch, api_key, model, log):
 
 
 def translate_batch_ark(subs_batch, api_key, model, log):
-    """火山引擎 ARK 翻译，返回 {index: (zh, emoji)} 字典"""
     import urllib.request
 
     lines = [f"{sub.index}. {sub.content}" for sub in subs_batch]
@@ -381,6 +393,415 @@ def run_transcribe(config, log):
         log(traceback.format_exc())
 
 
+def query_video_info(url):
+    """
+    Returns (info_dict, error_str). Runs in background thread.
+    info_dict contains: title, uploader, duration, heights, manual_subs, auto_subs, has_ffmpeg
+    """
+    import shutil
+    try:
+        import yt_dlp
+    except ImportError:
+        return None, "未安装 yt-dlp，请运行: pip install yt-dlp"
+
+    has_ffmpeg = bool(shutil.which('ffmpeg'))
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+            raw = ydl.extract_info(url, download=False)
+    except Exception as e:
+        return None, _clean(str(e))
+
+    title = raw.get('title', 'video')
+    duration = raw.get('duration', 0) or 0
+    uploader = raw.get('uploader', '')
+
+    # Collect available video heights (from formats that carry video)
+    heights = sorted(
+        {f['height'] for f in raw.get('formats', [])
+         if f.get('vcodec', 'none') != 'none' and f.get('height')},
+        reverse=True
+    )
+
+    # Subtitles: {lang_code: {'name': str, 'type': 'manual'|'auto'}}
+    subs = {}
+    for lang, fmts in raw.get('subtitles', {}).items():
+        name = _LANG_NAMES.get(lang, lang)
+        if fmts and isinstance(fmts, list) and fmts[0].get('name'):
+            name = fmts[0]['name']
+        subs[lang] = {'name': name, 'type': 'manual'}
+    for lang, fmts in raw.get('automatic_captions', {}).items():
+        if lang not in subs:
+            name = _LANG_NAMES.get(lang, lang)
+            if fmts and isinstance(fmts, list) and fmts[0].get('name'):
+                name = fmts[0]['name']
+            subs[lang] = {'name': name, 'type': 'auto'}
+
+    return {
+        'title': title,
+        'uploader': uploader,
+        'duration': duration,
+        'heights': heights,
+        'subs': subs,
+        'has_ffmpeg': has_ffmpeg,
+    }, None
+
+
+def run_download(config, log):
+    """
+    config keys: url, save_dir, title, format_str, subtitle_langs, audio_only
+    subtitle_langs: list of lang codes, empty = no subtitles
+    """
+    try:
+        import yt_dlp
+    except ImportError:
+        log("❌ 未安装 yt-dlp，请运行: pip install yt-dlp")
+        return None
+
+    url = config['url']
+    save_dir = config['save_dir']
+    title = config['title']
+    format_str = config['format_str']
+    subtitle_langs = config.get('subtitle_langs', [])
+    audio_only = config.get('audio_only', False)
+    also_audio = config.get('also_audio', False)
+
+    try:
+        os.makedirs(save_dir, exist_ok=True)
+    except Exception as e:
+        log(f"❌ 无法创建目录: {e}")
+        return None
+
+    safe_title = re.sub(r'[\\/:*?"<>|]', '_', title).strip()[:40]
+    video_dir = os.path.join(save_dir, safe_title)
+    os.makedirs(video_dir, exist_ok=True)
+    log(f"📁 保存至: {video_dir}")
+
+    impersonate_target = None
+    if subtitle_langs:
+        try:
+            import curl_cffi  # noqa: F401
+            try:
+                from yt_dlp.networking.impersonate import ImpersonateTarget
+                impersonate_target = ImpersonateTarget('chrome')
+                log("🔒 已启用浏览器伪装（curl_cffi Chrome），有助于下载中文字幕")
+            except Exception:
+                pass
+        except ImportError:
+            log("⚠️  未安装 curl_cffi，中文字幕可能因 429 失败")
+            log("💡  一次性修复: pip install curl_cffi")
+
+    class YDLLogger:
+        def debug(self, msg):
+            # 过滤 [debug] 和 [download] 进度行（进度由 progress_hook 统一处理）
+            if msg.startswith('[debug]') or msg.startswith('[download]'):
+                return
+            log(_clean(msg))
+        def info(self, msg):
+            log(_clean(msg))
+        def warning(self, msg):
+            cleaned = _clean(msg)
+            log(f"⚠️ {cleaned}")
+            if 'impersonation' in cleaned:
+                log("💡 提示: 安装 curl_cffi 可修复中文字幕 429 问题 → pip install curl_cffi")
+        def error(self, msg):
+            log(f"❌ {_clean(msg)}")
+
+    last_pct = [""]
+
+    def progress_hook(d):
+        if d['status'] == 'downloading':
+            pct = _clean(d.get('_percent_str', '')).strip()
+            if pct and pct != last_pct[0]:
+                last_pct[0] = pct
+                speed = _clean(d.get('_speed_str', '')).strip()
+                eta = _clean(d.get('_eta_str', '')).strip()
+                log(f"⬇️ {pct}  速度: {speed}  剩余: {eta}")
+        elif d['status'] == 'finished':
+            log(f"✅ 完成: {os.path.basename(d.get('filename', ''))}")
+
+    postprocessors = []
+    if subtitle_langs:
+        postprocessors.append({'key': 'FFmpegSubtitlesConvertor', 'format': 'srt'})
+    if audio_only or also_audio:
+        postprocessors.append({'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'})
+
+    ydl_opts = {
+        'format': format_str,
+        'outtmpl': os.path.join(video_dir, '%(title)s.%(ext)s'),
+        'writesubtitles': bool(subtitle_langs),
+        'writeautomaticsub': bool(subtitle_langs),
+        'subtitleslangs': subtitle_langs if subtitle_langs else [],
+        'merge_output_format': 'mp4' if not audio_only else None,
+        'keepvideo': also_audio,
+        'postprocessors': postprocessors,
+        'progress_hooks': [progress_hook],
+        'logger': YDLLogger(),
+        'no_warnings': True,
+        'ignoreerrors': True,
+        'sleep_interval_subtitles': 2,
+        'retries': 5,
+    }
+    if impersonate_target is not None:
+        ydl_opts['impersonate'] = impersonate_target
+
+    log("⬇️ 开始下载...")
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        err_str = _clean(str(e))
+        if 'Impersonate target' in str(e) and 'impersonate' in ydl_opts:
+            log("⚠️ 伪装目标不可用，改用普通模式重试...")
+            ydl_opts.pop('impersonate')
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+            except Exception as e2:
+                log(f"❌ 下载失败: {_clean(str(e2))}")
+                import traceback
+                log(traceback.format_exc())
+                return video_dir
+        else:
+            log(f"❌ 下载失败: {err_str}")
+            import traceback
+            log(traceback.format_exc())
+            return video_dir
+
+    all_files = os.listdir(video_dir)
+    video_exts = ('.mp4', '.mkv', '.webm', '.mp3', '.m4a', '.opus')
+    media_files = [f for f in all_files if os.path.splitext(f)[1].lower() in video_exts]
+    if media_files:
+        log(f"🎉 全部完成！文件保存至: {video_dir}")
+    else:
+        log("⚠️ 媒体文件未找到，字幕或其他文件可能已下载，请检查日志")
+    return video_dir
+
+
+# ── 格式选择弹窗 ──────────────────────────────────────────────────────────────
+
+class FormatDialog(tk.Toplevel):
+    """
+    Modal dialog that shows available resolutions and subtitles for a YouTube video.
+    Calls on_confirm(result_dict) when user confirms, destroys itself on cancel.
+    """
+
+    # Preferred language order for subtitle display
+    _LANG_ORDER = ['en', 'zh-Hans', 'zh-Hant', 'zh', 'ja', 'ko', 'fr', 'de',
+                   'es', 'ru', 'pt', 'ar', 'it']
+
+    def __init__(self, parent, info, on_confirm, on_cancel):
+        super().__init__(parent)
+        self.title("选择下载格式")
+        self.configure(bg="#1e1e1e")
+        self.resizable(True, True)
+        self.grab_set()
+        self._info = info
+        self._on_confirm = on_confirm
+        self._on_cancel = on_cancel
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        # Center over parent, enforce max size before showing
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        max_w = min(560, sw - 80)
+        max_h = min(480, sh - 120)
+        self.maxsize(max_w, max_h)
+        w = min(self.winfo_width(), max_w)
+        h = min(self.winfo_height(), max_h)
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        x = px + (pw - w) // 2
+        y = py + (ph - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _lbl(self, parent, text, color="#888888", size=9):
+        return tk.Label(parent, text=text, bg="#1e1e1e", fg=color,
+                        font=("Segoe UI", size), anchor="w")
+
+    def _section(self, parent, row, text):
+        tk.Label(parent, text=text, bg="#1e1e1e", fg="#555555",
+                 font=("Segoe UI", 8)).grid(row=row, column=0, columnspan=2,
+                                             sticky="w", padx=16, pady=(12, 2))
+        tk.Frame(parent, bg="#333333", height=1).grid(
+            row=row+1, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 6))
+
+    def _build(self):
+        info = self._info
+        p = self
+
+        # ── 视频信息 ──
+        title = info['title']
+        short_title = title if len(title) <= 60 else title[:57] + "..."
+        tk.Label(p, text=short_title, bg="#1e1e1e", fg="#ffffff",
+                 font=("Segoe UI", 10, "bold"), wraplength=480, justify="left",
+                 anchor="w").grid(row=0, column=0, columnspan=2,
+                                  sticky="w", padx=16, pady=(14, 0))
+
+        dur = info['duration']
+        meta = f"👤 {info['uploader']}   ⏱ {int(dur//60)}:{int(dur%60):02d}" if info['uploader'] else f"⏱ {int(dur//60)}:{int(dur%60):02d}"
+        self._lbl(p, meta, "#666666", 9).grid(row=1, column=0, columnspan=2,
+                                               sticky="w", padx=16, pady=(2, 4))
+
+        # ── ffmpeg 警告 ──
+        if not info['has_ffmpeg']:
+            tk.Label(p, text="⚠️  未检测到 ffmpeg — 高分辨率视频需要 ffmpeg 才能合并音视频流。\n    建议安装 ffmpeg 后重试，或选择「仅音频」。",
+                     bg="#2a1f00", fg="#ffcc44", font=("Segoe UI", 9),
+                     justify="left", anchor="w", padx=10, pady=6
+                     ).grid(row=2, column=0, columnspan=2, sticky="ew", padx=16, pady=(4, 0))
+
+        # ── 下载类型 ──
+        self._section(p, 3, "  下 载 内 容")
+        f_type = tk.Frame(p, bg="#1e1e1e")
+        f_type.grid(row=5, column=0, columnspan=2, sticky="w", padx=24, pady=(0, 4))
+        self._video_var = tk.BooleanVar(value=True)
+        self._audio_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(f_type, text="视频（MP4）", variable=self._video_var,
+                       bg="#1e1e1e", fg="#cccccc", selectcolor="#2d2d2d",
+                       activebackground="#1e1e1e", font=("Segoe UI", 10),
+                       command=self._on_content_change).pack(side="left", padx=(0, 24))
+        tk.Checkbutton(f_type, text="音频（MP3）", variable=self._audio_var,
+                       bg="#1e1e1e", fg="#cccccc", selectcolor="#2d2d2d",
+                       activebackground="#1e1e1e", font=("Segoe UI", 10)
+                       ).pack(side="left")
+
+        # ── 分辨率 ──
+        self._section(p, 6, "  分 辨 率  （视频+音频时可用）")
+        self._height_var = tk.StringVar(value="best")
+        self._height_frame = tk.Frame(p, bg="#1e1e1e")
+        self._height_frame.grid(row=8, column=0, columnspan=2, sticky="w", padx=24, pady=(0, 4))
+
+        heights = info['heights']
+        choices = [("best", "最高可用")]
+        for h in heights:
+            choices.append((str(h), f"{h}p"))
+
+        self._height_radios = []
+        for val, lbl in choices:
+            rb = tk.Radiobutton(self._height_frame, text=lbl, variable=self._height_var, value=val,
+                                bg="#1e1e1e", fg="#cccccc", selectcolor="#2d2d2d",
+                                activebackground="#1e1e1e", font=("Segoe UI", 10))
+            rb.pack(side="left", padx=(0, 12))
+            self._height_radios.append(rb)
+
+        if not heights:
+            self._lbl(self._height_frame, "（无可用视频流）", "#555555").pack(side="left")
+
+        # ── 字幕 ──
+        self._section(p, 9, "  字 幕")
+        subs = info['subs']
+
+        f_sub_header = tk.Frame(p, bg="#1e1e1e")
+        f_sub_header.grid(row=11, column=0, columnspan=2, sticky="w", padx=24, pady=(0, 2))
+        self._sub_all_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(f_sub_header, text="全选", variable=self._sub_all_var,
+                       bg="#1e1e1e", fg="#aaaaaa", selectcolor="#2d2d2d",
+                       activebackground="#1e1e1e", font=("Segoe UI", 9),
+                       command=self._toggle_all_subs).pack(side="left")
+
+        if not subs:
+            self._lbl(f_sub_header, "  （该视频没有字幕）", "#555555").pack(side="left")
+
+        # Build subtitle checkboxes in a scrollable-ish frame (canvas + frame for many subs)
+        sub_outer = tk.Frame(p, bg="#1e1e1e")
+        sub_outer.grid(row=12, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 4))
+
+        self._sub_vars = {}  # lang_code -> BooleanVar
+
+        # Only show Chinese and English subtitle options
+        _SHOW_LANGS = {'en', 'zh', 'zh-Hans', 'zh-Hant'}
+        _ORDER = ['en', 'zh-Hans', 'zh-Hant', 'zh']
+        filtered = {k: v for k, v in subs.items() if k in _SHOW_LANGS}
+        sorted_langs = sorted(filtered.keys(),
+                              key=lambda l: _ORDER.index(l) if l in _ORDER else 99)
+
+        if not filtered and subs:
+            self._lbl(f_sub_header, "  （无中英文字幕）", "#555555").pack(side="left")
+
+        cols = 2
+        for i, lang in enumerate(sorted_langs):
+            meta = filtered[lang]
+            var = tk.BooleanVar(value=False)
+            self._sub_vars[lang] = var
+            type_tag = "[手动]" if meta['type'] == 'manual' else "[自动]"
+            type_color = "#7ec8a0" if meta['type'] == 'manual' else "#888888"
+            row_f = tk.Frame(sub_outer, bg="#1e1e1e")
+            row_f.grid(row=i // cols, column=i % cols, sticky="w", padx=(0, 20), pady=1)
+            cb = tk.Checkbutton(row_f, text=f"{meta['name']} ({lang})",
+                                variable=var, bg="#1e1e1e", fg="#cccccc",
+                                selectcolor="#2d2d2d", activebackground="#1e1e1e",
+                                font=("Segoe UI", 9))
+            cb.pack(side="left")
+            tk.Label(row_f, text=type_tag, bg="#1e1e1e", fg=type_color,
+                     font=("Segoe UI", 8)).pack(side="left", padx=(2, 0))
+
+        # ── 按钮 ──
+        sep = tk.Frame(p, bg="#333333", height=1)
+        sep.grid(row=13, column=0, columnspan=2, sticky="ew", padx=16, pady=(10, 0))
+        f_btn = tk.Frame(p, bg="#1e1e1e")
+        f_btn.grid(row=14, column=0, columnspan=2, pady=12)
+        tk.Button(f_btn, text="取消", command=self._cancel,
+                  bg="#3a3a3a", fg="#cccccc", relief="flat", padx=20, pady=7,
+                  font=("Segoe UI", 10), cursor="hand2",
+                  activebackground="#4a4a4a").pack(side="left", padx=(0, 12))
+        tk.Button(f_btn, text="⬇  确认下载", command=self._confirm,
+                  bg="#0078d4", fg="#ffffff", relief="flat", padx=20, pady=7,
+                  font=("Segoe UI", 10, "bold"), cursor="hand2",
+                  activebackground="#005fa3").pack(side="left")
+
+        self._on_content_change()
+
+    def _on_content_change(self):
+        state = "normal" if self._video_var.get() else "disabled"
+        for rb in self._height_radios:
+            rb.configure(state=state)
+
+    def _toggle_all_subs(self):
+        val = self._sub_all_var.get()
+        for var in self._sub_vars.values():
+            var.set(val)
+
+    def _confirm(self):
+        want_video = self._video_var.get()
+        want_audio = self._audio_var.get()
+
+        if not want_video and not want_audio:
+            messagebox.showwarning("请选择", "请至少勾选「视频」或「音频」之一", parent=self)
+            return
+
+        height_val = self._height_var.get()
+        subtitle_langs = [lang for lang, var in self._sub_vars.items() if var.get()]
+
+        if not want_video:
+            fmt = "bestaudio/best"
+            audio_only = True
+            also_audio = False
+        elif height_val == "best":
+            fmt = "bestvideo+bestaudio/best"
+            audio_only = False
+            also_audio = want_audio
+        else:
+            h = height_val
+            fmt = f"bestvideo[height<={h}]+bestaudio/bestvideo[height<={h}]/best[height<={h}]"
+            audio_only = False
+            also_audio = want_audio
+
+        result = {
+            'format_str': fmt,
+            'subtitle_langs': subtitle_langs,
+            'audio_only': audio_only,
+            'also_audio': also_audio,
+        }
+        self.destroy()
+        self._on_confirm(result)
+
+    def _cancel(self):
+        self.destroy()
+        self._on_cancel()
+
+
+# ── 主窗口 ────────────────────────────────────────────────────────────────────
+
 class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def __init__(self):
         super().__init__()
@@ -389,14 +810,29 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.configure(bg="#1e1e1e")
         self.minsize(600, 550)
         self._log_queue = queue.Queue()
+        self._dl_log_queue = queue.Queue()
         self._is_running = False
+        self._dl_is_running = False
+        self._last_dl_dir = ""
         self._saved_config = load_config()
+        self._apply_style()
         self._build()
         self._poll_log()
+        self._poll_dl_log()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    def _apply_style(self):
+        style = ttk.Style(self)
+        style.theme_use('default')
+        style.configure('TNotebook', background='#1e1e1e', borderwidth=0)
+        style.configure('TNotebook.Tab', background='#2a2a2a', foreground='#888888',
+                        padding=[16, 6], font=('Segoe UI', 9))
+        style.map('TNotebook.Tab',
+                  background=[('selected', '#1e1e1e')],
+                  foreground=[('selected', '#ffffff')])
+
     def _on_close(self):
-        if self._is_running:
+        if self._is_running or self._dl_is_running:
             if not messagebox.askyesno("进行中", "任务还在进行中，确定要退出吗？"):
                 return
         self._do_save_config()
@@ -429,6 +865,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "ark_custom_models": ark_custom,
             "translate_enabled": self.translate_var.get(),
             "batch_size": self.batch_var.get().strip(),
+            "download_dir": self.dl_dir_var.get().strip(),
         })
 
     def _poll_log(self):
@@ -442,6 +879,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self._poll_log)
+
+    def _poll_dl_log(self):
+        try:
+            while True:
+                msg = self._dl_log_queue.get_nowait()
+                self.dl_log_box.configure(state="normal")
+                self.dl_log_box.insert("end", msg + "\n")
+                self.dl_log_box.see("end")
+                self.dl_log_box.configure(state="disabled")
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_dl_log)
 
     def _lbl(self, parent, text):
         return tk.Label(parent, text=text, bg="#1e1e1e", fg="#888888",
@@ -467,13 +916,27 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def _build(self):
         cfg = self._saved_config
         self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
 
-        # ── 转写区 ──────────────────────────────
-        tk.Label(self, text="  转 写", bg="#1e1e1e", fg="#555555",
+        nb = ttk.Notebook(self)
+        nb.grid(row=0, column=0, sticky="nsew")
+
+        tab_t = tk.Frame(nb, bg="#1e1e1e")
+        tab_d = tk.Frame(nb, bg="#1e1e1e")
+        tab_t.columnconfigure(0, weight=1)
+        tab_d.columnconfigure(0, weight=1)
+        nb.add(tab_t, text="  转 写  ")
+        nb.add(tab_d, text="  下 载  ")
+
+        self._build_transcribe(tab_t, cfg)
+        self._build_download(tab_d, cfg)
+
+    def _build_transcribe(self, p, cfg):
+        tk.Label(p, text="  转 写", bg="#1e1e1e", fg="#555555",
                  font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w", padx=16, pady=(12, 0))
 
         self.video_var = tk.StringVar()
-        drop_frame = tk.Frame(self, bg="#252525")
+        drop_frame = tk.Frame(p, bg="#252525")
         drop_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=(2, 4))
         drop_frame.columnconfigure(0, weight=1)
         self.drop_label = tk.Label(drop_frame, text="🎬  拖拽视频到此处，或点击浏览",
@@ -493,23 +956,19 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                 w.drop_target_register(DND_FILES)
                 w.dnd_bind("<<Drop>>", self._on_drop)
 
-        # 模型路径  (row=1 → grid rows 2,3)
         self.model_var = tk.StringVar(value=cfg["model_path"])
-        self._entry_row(self, 1, "Whisper 模型路径", self.model_var, self._browse_model)
+        self._entry_row(p, 1, "Whisper 模型路径", self.model_var, self._browse_model)
 
-        # 保存路径  (row=2 → grid rows 4,5)
         self.save_var = tk.StringVar()
-        self._entry_row(self, 2, "SRT 保存路径（空=与源文件同目录）", self.save_var, self._browse_save, "另存为")
+        self._entry_row(p, 2, "SRT 保存路径（空=与源文件同目录）", self.save_var, self._browse_save, "另存为")
 
-        # 现有英文 SRT（可选）  (row=3 → grid rows 6,7)
         self.srt_var = tk.StringVar()
-        srt_entry = self._entry_row(self, 3, "现有英文 SRT（可选，提供后跳过本地识别）", self.srt_var, self._browse_srt)
+        srt_entry = self._entry_row(p, 3, "现有英文 SRT（可选，提供后跳过本地识别）", self.srt_var, self._browse_srt)
         if HAS_DND:
             srt_entry.drop_target_register(DND_FILES)
             srt_entry.dnd_bind("<<Drop>>", self._on_drop_srt)
 
-        # 选项行
-        f_opts = tk.Frame(self, bg="#1e1e1e")
+        f_opts = tk.Frame(p, bg="#1e1e1e")
         f_opts.grid(row=9, column=0, sticky="ew", padx=16, pady=8)
 
         def olbl(t): tk.Label(f_opts, text=t, bg="#1e1e1e", fg="#888888",
@@ -535,18 +994,16 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.chars_var = tk.StringVar(value=cfg["max_chars"])
         oentry(self.chars_var, 5)
 
-        # 初始提示词
-        self._lbl(self, "初始提示词（可选）").grid(row=10, column=0, sticky="w", padx=16, pady=(2, 0))
+        self._lbl(p, "初始提示词（可选）").grid(row=10, column=0, sticky="w", padx=16, pady=(2, 0))
         self.prompt_var = tk.StringVar(value=cfg["initial_prompt"])
-        tk.Entry(self, textvariable=self.prompt_var, bg="#2d2d2d", fg="#ffffff",
+        tk.Entry(p, textvariable=self.prompt_var, bg="#2d2d2d", fg="#ffffff",
                  insertbackground="white", relief="flat", font=("Segoe UI", 10), bd=4
                  ).grid(row=11, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
 
-        # ── 翻译区 ──────────────────────────────
-        sep = tk.Frame(self, bg="#333333", height=1)
+        sep = tk.Frame(p, bg="#333333", height=1)
         sep.grid(row=12, column=0, sticky="ew", padx=16, pady=(8, 0))
 
-        f_trans_title = tk.Frame(self, bg="#1e1e1e")
+        f_trans_title = tk.Frame(p, bg="#1e1e1e")
         f_trans_title.grid(row=13, column=0, sticky="ew", padx=16, pady=(6, 0))
         tk.Label(f_trans_title, text="  翻 译", bg="#1e1e1e", fg="#555555",
                  font=("Segoe UI", 8)).pack(side="left")
@@ -556,8 +1013,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                        activebackground="#1e1e1e", font=("Segoe UI", 9)
                        ).pack(side="left", padx=(16, 0))
 
-        # 翻译服务选择
-        f_provider = tk.Frame(self, bg="#1e1e1e")
+        f_provider = tk.Frame(p, bg="#1e1e1e")
         f_provider.grid(row=14, column=0, sticky="w", padx=16, pady=(4, 0))
         tk.Label(f_provider, text="翻译服务", bg="#1e1e1e", fg="#888888",
                  font=("Segoe UI", 9)).pack(side="left")
@@ -569,35 +1025,31 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                            command=self._on_provider_change
                            ).pack(side="left", padx=(12, 0))
 
-        # 硅基流动 API Key（row 15, 16）
-        self._sf_key_lbl = self._lbl(self, "硅基流动 API Key")
+        self._sf_key_lbl = self._lbl(p, "硅基流动 API Key")
         self._sf_key_lbl.grid(row=15, column=0, sticky="w", padx=16, pady=(6, 0))
         self.sf_key_var = tk.StringVar(value=cfg.get("api_key", ""))
-        self._sf_key_entry = tk.Entry(self, textvariable=self.sf_key_var, bg="#2d2d2d", fg="#ffffff",
+        self._sf_key_entry = tk.Entry(p, textvariable=self.sf_key_var, bg="#2d2d2d", fg="#ffffff",
                                       insertbackground="white", relief="flat",
                                       font=("Segoe UI", 10), bd=4, show="*")
         self._sf_key_entry.grid(row=16, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
 
-        # 火山引擎 ARK API Key（row 15, 16 — 同位置，按 provider 切换）
-        self._ark_key_lbl = self._lbl(self, "火山引擎 ARK API Key")
+        self._ark_key_lbl = self._lbl(p, "火山引擎 ARK API Key")
         self._ark_key_lbl.grid(row=15, column=0, sticky="w", padx=16, pady=(6, 0))
         self.ark_key_var = tk.StringVar(value=cfg.get("ark_api_key", ""))
-        self._ark_key_entry = tk.Entry(self, textvariable=self.ark_key_var, bg="#2d2d2d", fg="#ffffff",
+        self._ark_key_entry = tk.Entry(p, textvariable=self.ark_key_var, bg="#2d2d2d", fg="#ffffff",
                                        insertbackground="white", relief="flat",
                                        font=("Segoe UI", 10), bd=4, show="*")
         self._ark_key_entry.grid(row=16, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
 
-        # 翻译模型
-        self._lbl(self, "翻译模型（可手动输入新模型后回车保存）").grid(
+        self._lbl(p, "翻译模型（可手动输入新模型后回车保存）").grid(
             row=17, column=0, sticky="w", padx=16, pady=(2, 0))
         self.trans_model_var = tk.StringVar()
-        self.trans_combo = ttk.Combobox(self, textvariable=self.trans_model_var,
+        self.trans_combo = ttk.Combobox(p, textvariable=self.trans_model_var,
                                          font=("Segoe UI", 10))
         self.trans_combo.grid(row=18, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
         self.trans_combo.bind("<Return>", self._add_custom_model)
 
-        # 每批行数
-        f_batch = tk.Frame(self, bg="#1e1e1e")
+        f_batch = tk.Frame(p, bg="#1e1e1e")
         f_batch.grid(row=19, column=0, sticky="w", padx=16, pady=(2, 4))
         tk.Label(f_batch, text="每批翻译行数", bg="#1e1e1e", fg="#888888",
                  font=("Segoe UI", 9)).pack(side="left")
@@ -606,22 +1058,75 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  insertbackground="white", relief="flat", font=("Segoe UI", 10),
                  bd=4).pack(side="left", padx=(8, 0), ipady=3)
 
-        # ── 开始按钮 ─────────────────────────────
-        self.btn = tk.Button(self, text="▶  开始", command=self._start,
+        self.btn = tk.Button(p, text="▶  开始", command=self._start,
                              bg="#0078d4", fg="#ffffff", relief="flat",
                              font=("Segoe UI", 11, "bold"), padx=24, pady=8,
                              cursor="hand2", activebackground="#005fa3")
         self.btn.grid(row=20, column=0, pady=12)
 
-        # 日志
-        self.rowconfigure(21, weight=1)
-        self.log_box = scrolledtext.ScrolledText(self, bg="#111111", fg="#cccccc",
+        p.rowconfigure(21, weight=1)
+        self.log_box = scrolledtext.ScrolledText(p, bg="#111111", fg="#cccccc",
                                                   font=("Consolas", 9), relief="flat",
                                                   state="disabled", height=10)
         self.log_box.grid(row=21, column=0, sticky="nsew", padx=16, pady=(0, 16))
 
-        # 初始化 provider 显示状态
         self._on_provider_change()
+
+    def _build_download(self, p, cfg):
+        p.columnconfigure(0, weight=1)
+        p.rowconfigure(6, weight=1)
+
+        # ── 区域标题 ──
+        tk.Label(p, text="  下 载", bg="#1e1e1e", fg="#555555",
+                 font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w",
+                                            padx=16, pady=(12, 0))
+
+        # ── 保存目录（含浏览按钮） ──
+        self._lbl(p, "视频保存目录（每个视频自动创建独立子文件夹）").grid(
+            row=1, column=0, sticky="w", padx=16, pady=(8, 0))
+        f_dir = tk.Frame(p, bg="#1e1e1e")
+        f_dir.grid(row=2, column=0, sticky="ew", padx=16, pady=(2, 0))
+        f_dir.columnconfigure(0, weight=1)
+        self.dl_dir_var = tk.StringVar(value=cfg.get("download_dir", ""))
+        tk.Entry(f_dir, textvariable=self.dl_dir_var, bg="#2d2d2d", fg="#ffffff",
+                 insertbackground="white", relief="flat",
+                 font=("Segoe UI", 10), bd=4).grid(row=0, column=0, sticky="ew", ipady=4)
+        tk.Button(f_dir, text="浏览", command=self._browse_dl_dir,
+                  bg="#3a3a3a", fg="#cccccc", relief="flat", padx=12,
+                  font=("Segoe UI", 9), cursor="hand2",
+                  activebackground="#4a4a4a").grid(row=0, column=1, padx=(6, 0))
+
+        # ── 视频链接 ──
+        self._lbl(p, "视频链接（支持 YouTube、X/Twitter、B站等）").grid(
+            row=3, column=0, sticky="w", padx=16, pady=(10, 0))
+        self.dl_url_var = tk.StringVar()
+        tk.Entry(p, textvariable=self.dl_url_var, bg="#2d2d2d", fg="#ffffff",
+                 insertbackground="white", relief="flat",
+                 font=("Segoe UI", 10), bd=4).grid(
+            row=4, column=0, sticky="ew", padx=16, pady=(2, 0), ipady=4)
+
+        # ── 操作按钮 ──
+        f_btn = tk.Frame(p, bg="#1e1e1e")
+        f_btn.grid(row=5, column=0, pady=14)
+        self.dl_btn = tk.Button(
+            f_btn, text="🔍  查询并选择格式", command=self._start_download,
+            bg="#0078d4", fg="#ffffff", relief="flat",
+            font=("Segoe UI", 10, "bold"), padx=20, pady=7,
+            cursor="hand2", activebackground="#005fa3")
+        self.dl_btn.pack(side="left")
+        tk.Button(
+            f_btn, text="📁 打开文件夹", command=self._open_dl_folder,
+            bg="#3a3a3a", fg="#cccccc", relief="flat",
+            font=("Segoe UI", 10), padx=20, pady=7,
+            cursor="hand2", activebackground="#4a4a4a").pack(side="left", padx=(10, 0))
+
+        # ── 日志 ──
+        self.dl_log_box = scrolledtext.ScrolledText(
+            p, bg="#111111", fg="#cccccc", font=("Consolas", 9),
+            relief="flat", state="disabled", height=10)
+        self.dl_log_box.grid(row=6, column=0, sticky="nsew", padx=16, pady=(0, 16))
+
+    # ── 转写标签页事件 ──────────────────────────────────────────────────────────
 
     def _on_provider_change(self):
         provider = self.provider_var.get()
@@ -754,6 +1259,120 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             run_transcribe(config, self._log)
             self._is_running = False
             self.btn.configure(state="normal", text="▶  开始")
+
+        threading.Thread(target=task, daemon=True).start()
+
+    # ── 下载标签页事件 ──────────────────────────────────────────────────────────
+
+    def _browse_dl_dir(self):
+        path = filedialog.askdirectory(title="选择视频保存目录")
+        if path:
+            self.dl_dir_var.set(path)
+
+    def _open_dl_folder(self):
+        folder = self._last_dl_dir or self.dl_dir_var.get().strip()
+        if not folder:
+            self._dl_log("❌ 请先完成一次下载或手动填写目录")
+            return
+        folder = os.path.normpath(folder)
+        if os.path.isdir(folder):
+            self._dl_log(f"📂 打开: {folder}")
+            os.startfile(folder)
+        else:
+            self._dl_log(f"❌ 文件夹不存在: {folder}")
+
+    def _dl_log(self, msg):
+        self._dl_log_queue.put(msg)
+
+    def _start_download(self):
+        url = self.dl_url_var.get().strip()
+        save_dir = self.dl_dir_var.get().strip()
+
+        if not url:
+            self._dl_log("❌ 请输入 YouTube 链接")
+            return
+        if not save_dir:
+            self._dl_log("❌ 请选择视频保存目录")
+            return
+
+        self._do_save_config()
+        self._dl_is_running = True
+        self.dl_btn.configure(state="disabled", text="查询中...")
+        self._dl_log(f"🔍 正在查询视频信息: {url}")
+
+        info_q = queue.Queue()
+
+        def query_task():
+            info, err = query_video_info(url)
+            info_q.put((info, err))
+
+        threading.Thread(target=query_task, daemon=True).start()
+
+        def check_info():
+            try:
+                info, err = info_q.get_nowait()
+            except queue.Empty:
+                self.after(200, check_info)
+                return
+
+            if err:
+                self._dl_log(f"❌ 查询失败: {err}")
+                self._dl_is_running = False
+                self.dl_btn.configure(state="normal", text="🔍  查询并选择格式")
+                return
+
+            self._dl_log(f"📺 {info['title']}")
+            dur = info['duration']
+            if info['uploader']:
+                self._dl_log(f"👤 {info['uploader']}  ⏱ {int(dur//60)}:{int(dur%60):02d}")
+            self._dl_log(f"📐 可用分辨率: {', '.join(str(h)+'p' for h in info['heights']) or '无视频流'}")
+            self._dl_log(f"💬 字幕: {len(info['subs'])} 种语言可用")
+
+            def on_confirm(fmt_opts):
+                self._begin_download(url, save_dir, info['title'], fmt_opts)
+
+            def on_cancel():
+                self._dl_is_running = False
+                self.dl_btn.configure(state="normal", text="🔍  查询并选择格式")
+                self._dl_log("取消下载")
+
+            FormatDialog(self, info, on_confirm, on_cancel)
+
+        self.after(200, check_info)
+
+    def _begin_download(self, url, save_dir, title, fmt_opts):
+        self.dl_btn.configure(state="disabled", text="下载中...")
+        # Pre-set the video subfolder path so the button works immediately
+        _safe = re.sub(r'[\\/:*?"<>|]', '_', title).strip()[:40]
+        self._last_dl_dir = os.path.normpath(os.path.join(save_dir, _safe))
+
+        parts = []
+        if fmt_opts.get('audio_only'):
+            parts.append("音频(MP3)")
+        else:
+            parts.append("视频(MP4)")
+            if fmt_opts.get('also_audio'):
+                parts.append("+ 音频(MP3)")
+        content_desc = " ".join(parts)
+        sub_desc = ", ".join(fmt_opts['subtitle_langs']) if fmt_opts['subtitle_langs'] else "无字幕"
+        self._dl_log(f"▶ 开始下载  [{content_desc}]  字幕: {sub_desc}")
+
+        dl_config = {
+            'url': url,
+            'save_dir': save_dir,
+            'title': title,
+            'format_str': fmt_opts['format_str'],
+            'subtitle_langs': fmt_opts['subtitle_langs'],
+            'audio_only': fmt_opts['audio_only'],
+            'also_audio': fmt_opts.get('also_audio', False),
+        }
+
+        def task():
+            result = run_download(dl_config, self._dl_log)
+            if result:
+                self._last_dl_dir = result
+            self._dl_is_running = False
+            self.dl_btn.configure(state="normal", text="🔍  查询并选择格式")
 
         threading.Thread(target=task, daemon=True).start()
 
