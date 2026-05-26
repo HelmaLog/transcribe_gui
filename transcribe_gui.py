@@ -40,7 +40,7 @@ from backend import (
     load_config, save_config,
     DEFAULT_MODELS_SF, DEFAULT_MODELS_ARK, DEFAULT_MODELS_GEMINI, DEFAULT_CONFIG,
     translate_batch, translate_batch_ark, translate_batch_gemini,
-    chat_completion,
+    chat_completion_stream,
     run_transcribe, query_video_info, run_download,
 )
 
@@ -1329,6 +1329,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._tweet_chat.see("end")
         self._tweet_chat.configure(state="disabled")
 
+    def _stream_tweet_chunk(self, text):
+        self._tweet_chat.configure(state="normal")
+        self._tweet_chat.insert("end", text, "ai_text")
+        self._tweet_chat.see("end")
+        self._tweet_chat.configure(state="disabled")
+
     def _send_tweet(self):
         if self._tweet_is_running:
             return
@@ -1351,14 +1357,19 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.tweet_send_btn.configure(state="disabled", text="···")
         self._append_tweet("AI\n", "ai_hdr")
 
+        def on_chunk(text):
+            self.after(0, lambda t=text: self._stream_tweet_chunk(t))
+
         def task():
-            reply, err = chat_completion(history, system_prompt, provider, api_key, model)
+            full_text, err = chat_completion_stream(
+                history, system_prompt, provider, api_key, model, on_chunk
+            )
             if err:
                 self.after(0, lambda: self._append_tweet(f"❌ {err}\n", "err_text"))
             else:
-                self._tweet_history.append({"role": "assistant", "content": reply})
-                r = reply
-                self.after(0, lambda: self._append_tweet(r + "\n", "ai_text"))
+                if full_text:
+                    self._tweet_history.append({"role": "assistant", "content": full_text})
+                self.after(0, lambda: self._stream_tweet_chunk("\n"))
             sep = "─" * 52 + "\n"
             self.after(0, lambda: self._append_tweet(sep, "sep"))
             self._tweet_is_running = False

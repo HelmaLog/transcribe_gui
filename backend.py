@@ -356,15 +356,17 @@ def translate_batch_gemini(subs_batch, keys, start_key_idx, model, log, stop_eve
 
 # ── Chat (for tweet assistant tab) ───────────────────────────────────────────
 
-def chat_completion(messages, system_prompt, provider, api_key, model):
+def chat_completion_stream(messages, system_prompt, provider, api_key, model, on_chunk):
     """
-    Multi-turn chat request.
+    Streaming chat. Calls on_chunk(text) for each text chunk received.
     messages: list of {"role": "user"|"assistant", "content": str}
     api_key: list of keys for Gemini, str for others
-    Returns: (reply_text, error_str)
+    Returns: (full_text, error_str)
     """
     import urllib.request
     import urllib.error
+
+    full_text = ""
 
     if provider == "gemini":
         keys = api_key if isinstance(api_key, list) else ([api_key] if api_key else [])
@@ -389,7 +391,7 @@ def chat_completion(messages, system_prompt, provider, api_key, model):
         for key in keys:
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent?key={key}"
+                f"{model}:streamGenerateContent?alt=sse&key={key}"
             )
             req = urllib.request.Request(
                 url, data=payload,
@@ -398,8 +400,21 @@ def chat_completion(messages, system_prompt, provider, api_key, model):
             )
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
-                    result = json.loads(resp.read().decode("utf-8"))
-                return result["candidates"][0]["content"]["parts"][0]["text"], None
+                    for raw_line in resp:
+                        line = raw_line.decode("utf-8").rstrip("\r\n")
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            text = chunk["candidates"][0]["content"]["parts"][0]["text"]
+                            full_text += text
+                            on_chunk(text)
+                        except (KeyError, IndexError, json.JSONDecodeError):
+                            pass
+                return full_text, None
             except urllib.error.HTTPError as e:
                 if e.code == 429:
                     continue
@@ -413,9 +428,10 @@ def chat_completion(messages, system_prompt, provider, api_key, model):
                 return None, str(e)
         return None, "所有 Gemini Key 均被限速，请稍后重试"
 
-    elif provider == "siliconflow":
+    elif provider in ("siliconflow", "volcengine"):
         if not api_key:
-            return None, "未配置硅基流动 API Key，请在「转写」标签页中填写"
+            name = "硅基流动" if provider == "siliconflow" else "火山引擎 ARK"
+            return None, f"未配置{name} API Key，请在「转写」标签页中填写"
         msgs = []
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
@@ -425,43 +441,35 @@ def chat_completion(messages, system_prompt, provider, api_key, model):
             "messages": msgs,
             "temperature": 0.7,
             "max_tokens": 4096,
+            "stream": True,
         }).encode("utf-8")
+        if provider == "siliconflow":
+            url = "https://api.siliconflow.cn/v1/chat/completions"
+        else:
+            url = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
         req = urllib.request.Request(
-            "https://api.siliconflow.cn/v1/chat/completions",
-            data=payload,
+            url, data=payload,
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
             method="POST"
         )
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-            return result["choices"][0]["message"]["content"], None
-        except Exception as e:
-            return None, str(e)
-
-    elif provider == "volcengine":
-        if not api_key:
-            return None, "未配置火山引擎 ARK API Key，请在「转写」标签页中填写"
-        msgs = []
-        if system_prompt:
-            msgs.append({"role": "system", "content": system_prompt})
-        msgs.extend(messages)
-        payload = json.dumps({
-            "model": model,
-            "messages": msgs,
-            "temperature": 0.7,
-            "max_tokens": 4096,
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-            method="POST"
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-            return result["choices"][0]["message"]["content"], None
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8").rstrip("\r\n")
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        text = chunk["choices"][0]["delta"].get("content", "")
+                        if text:
+                            full_text += text
+                            on_chunk(text)
+                    except (KeyError, IndexError, json.JSONDecodeError):
+                        pass
+            return full_text, None
         except Exception as e:
             return None, str(e)
 
