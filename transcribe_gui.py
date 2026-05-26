@@ -55,6 +55,16 @@ DEFAULT_MODELS_ARK = [
     "doubao-pro-256k-241115",
 ]
 
+DEFAULT_MODELS_GEMINI = [
+    "gemini-2.5-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-pro",
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+]
+
 DEFAULT_CONFIG = {
     "model_path": "",
     "device": "cuda",
@@ -69,6 +79,10 @@ DEFAULT_CONFIG = {
     "ark_api_key": "",
     "ark_model": DEFAULT_MODELS_ARK[0],
     "ark_custom_models": [],
+    "gemini_api_keys": "",
+    "gemini_model": DEFAULT_MODELS_GEMINI[0],
+    "gemini_custom_models": [],
+    "gemini_threads": "1",
     "translate_enabled": False,
     "batch_size": "15",
     "download_dir": "",
@@ -108,6 +122,37 @@ def save_config(cfg):
             json.dump(cfg, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+def _flatten_youtube_subs(subs, srt_mod):
+    """
+    处理 YouTube 滚动字幕格式：
+    提取每条唯一文字的首次出现时刻，以下一条新文字首次出现为结束，
+    产生严格不重叠的干净字幕序列。
+    """
+    if not subs:
+        return subs
+
+    seen = set()
+    order = []       # 按首次出现顺序排列的唯一行文本
+    first_time = {}  # text → 首次出现的 start 时间
+
+    for sub in subs:
+        for ln in sub.content.splitlines():
+            ln = ln.strip()
+            if ln and ln not in seen:
+                seen.add(ln)
+                first_time[ln] = sub.start
+                order.append(ln)
+
+    result = []
+    for i, text in enumerate(order):
+        start = first_time[text]
+        end = first_time[order[i + 1]] if i + 1 < len(order) else subs[-1].end
+        if end > start:
+            result.append(srt_mod.Subtitle(len(result) + 1, start, end, text))
+
+    return result
 
 
 def _parse_translation(content):
@@ -245,7 +290,78 @@ def translate_batch_ark(subs_batch, api_key, model, log):
     return _parse_translation(content) if content else {}
 
 
-def run_transcribe(config, log):
+def translate_batch_gemini(subs_batch, keys, start_key_idx, model, log, stop_event=None):
+    import urllib.request
+    import urllib.error
+    import time
+
+    def _wait(seconds):
+        """可被 stop_event 打断的 sleep，返回 True 表示被停止。"""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if stop_event and stop_event.is_set():
+                return True
+            time.sleep(0.3)
+        return False
+
+    lines = [f"{sub.index}. {sub.content}" for sub in subs_batch]
+    prompt = f"""你是专业字幕翻译，请将以下英文字幕翻译为中文，并为每行选一个最贴切的表情符号。
+
+要求：
+- 严格保持行号一一对应，不合并不拆分
+- 每行输出格式：行号. 表情 中文翻译
+- 只输出翻译结果，不要解释
+
+字幕内容：
+{chr(10).join(lines)}"""
+
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2000},
+    }).encode("utf-8")
+
+    n = len(keys)
+    # 最多尝试：遍历所有 key 2 轮，每轮全部 429 才等待一次
+    for round_ in range(2):
+        for ki in range(n):
+            if stop_event and stop_event.is_set():
+                return {}
+            key = keys[(start_key_idx + ki) % n]
+            key_label = f"Key{(start_key_idx + ki) % n + 1}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+            req = urllib.request.Request(
+                url, data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            try:
+                log(f"  → [{key_label}] 等待 Gemini 响应...")
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+                content = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+                log("  ← 收到响应：")
+                for line in content.splitlines():
+                    if line.strip():
+                        log(f"    {line}")
+                return _parse_translation(content)
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    log(f"  ⚠️ [{key_label}] 限速 (429)，切换下一个 Key...")
+                else:
+                    log(f"  ⚠️ [{key_label}] 请求失败: {e}")
+            except Exception as e:
+                log(f"  ⚠️ [{key_label}] 请求失败: {e}")
+        # 所有 key 本轮均失败，等待后重试
+        if round_ == 0:
+            log("⚠️ 所有 Key 均限速，等待 30s 后重试（点停止可立即中断）...")
+            if _wait(30):
+                return {}
+
+    log("⚠️ 跳过本批（所有 Key 均已耗尽）")
+    return {}
+
+
+def run_transcribe(config, log, stop_event=None):
     try:
         import srt
         from srt_equalizer import srt_equalizer
@@ -263,18 +379,37 @@ def run_transcribe(config, log):
         save_path = config["save_path"]
         translate_enabled = config["translate_enabled"]
         provider = config.get("provider", "siliconflow")
-        api_key = config["api_key"] if provider == "siliconflow" else config.get("ark_api_key", "")
-        translate_model = config["translate_model"] if provider == "siliconflow" else config.get("ark_model", "")
+        if provider == "siliconflow":
+            api_key = config["api_key"]
+            translate_model = config["translate_model"]
+            translate_fn = translate_batch
+        elif provider == "volcengine":
+            api_key = config.get("ark_api_key", "")
+            translate_model = config.get("ark_model", "")
+            translate_fn = translate_batch_ark
+        else:
+            raw_keys = config.get("gemini_api_keys", "")
+            gemini_keys = [k.strip() for k in raw_keys.splitlines() if k.strip()]
+            api_key = gemini_keys[0] if gemini_keys else ""
+            translate_model = config.get("gemini_model", DEFAULT_MODELS_GEMINI[0])
+            translate_fn = None  # Gemini uses its own call path below
         batch_size = config["batch_size"]
-        translate_fn = translate_batch if provider == "siliconflow" else translate_batch_ark
 
         use_existing_srt = bool(srt_path and os.path.exists(srt_path))
 
         if use_existing_srt:
             log(f"使用已有英文字幕: {os.path.basename(srt_path)}")
             with open(srt_path, "r", encoding="utf-8") as f:
-                split_subs = list(srt.parse(f.read()))
-            log(f"已加载 {len(split_subs)} 条字幕")
+                raw_subs = list(srt.parse(f.read()))
+            log(f"已加载 {len(raw_subs)} 条字幕，处理 YouTube 滚动字幕格式...")
+            raw_subs = _flatten_youtube_subs(raw_subs, srt)
+            log(f"展开后 {len(raw_subs)} 条，开始按 {max_chars} 字符切分...")
+            split_subs = []
+            for sub in raw_subs:
+                split_subs.extend(srt_equalizer.split_subtitle(sub, max_chars))
+            for i, sub in enumerate(split_subs, 1):
+                sub.index = i
+            log(f"切分完成，共 {len(split_subs)} 条")
 
             srt_stem = os.path.splitext(os.path.basename(srt_path))[0]
             if srt_stem.endswith("_英文"):
@@ -354,20 +489,39 @@ def run_transcribe(config, log):
             else:
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 batches = [split_subs[i:i+batch_size] for i in range(0, len(split_subs), batch_size)]
-                provider_name = "硅基流动" if provider == "siliconflow" else "火山引擎 ARK"
-                log(f"开始翻译，{provider_name} / {translate_model}，每批 {batch_size} 行，共 {len(batches)} 批，3 路并发...")
+                provider_name = {"siliconflow": "硅基流动", "volcengine": "火山引擎 ARK"}.get(provider, "Google Gemini")
+
+                if provider == "gemini":
+                    concurrency = max(1, int(config.get("gemini_threads", 1)))
+                else:
+                    concurrency = 3
+
+                log(f"开始翻译，{provider_name} / {translate_model}，每批 {batch_size} 行，共 {len(batches)} 批，{concurrency} 路并发...")
                 translations = {}
-                with ThreadPoolExecutor(max_workers=3) as executor:
-                    future_to_bi = {
-                        executor.submit(translate_fn, batch, api_key, translate_model, log): bi
-                        for bi, batch in enumerate(batches)
-                    }
+                stopped = False
+
+                with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                    if provider == "gemini":
+                        future_to_bi = {
+                            executor.submit(translate_batch_gemini, batch, gemini_keys, bi % len(gemini_keys), translate_model, log, stop_event): bi
+                            for bi, batch in enumerate(batches)
+                        }
+                    else:
+                        future_to_bi = {
+                            executor.submit(translate_fn, batch, api_key, translate_model, log): bi
+                            for bi, batch in enumerate(batches)
+                        }
                     for future in as_completed(future_to_bi):
                         bi = future_to_bi[future]
                         result = future.result()
                         translations.update(result)
                         done = sum(1 for f in future_to_bi if f.done())
                         log(f"✅ 第 {bi+1}/{len(batches)} 批完成，共 {len(result)} 行（已完成 {done}/{len(batches)}）")
+                        if stop_event and stop_event.is_set():
+                            for f in future_to_bi:
+                                f.cancel()
+                            stopped = True
+                            break
 
                 bilingual_subs = []
                 for sub in split_subs:
@@ -380,12 +534,19 @@ def run_transcribe(config, log):
                         index=sub.index, start=sub.start, end=sub.end, content=content,
                     ))
 
-                bi_path = base_path + "_双语.srt"
+                suffix = "_部分双语" if stopped else "_双语"
+                bi_path = base_path + suffix + ".srt"
                 with open(bi_path, "w", encoding="utf-8") as f:
                     f.write(srt.compose(bilingual_subs))
-                log(f"✅ 双语字幕已保存: {bi_path}")
+                if stopped:
+                    log(f"⏹ 已停止，部分双语字幕已保存（{len(translations)}/{len(split_subs)} 行）: {bi_path}")
+                else:
+                    log(f"✅ 双语字幕已保存: {bi_path}")
 
-        log("🎉 全部完成！")
+        if stop_event and stop_event.is_set():
+            log("⏹ 任务已停止")
+        else:
+            log("🎉 全部完成！")
 
     except Exception as e:
         import traceback
@@ -814,6 +975,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._is_running = False
         self._dl_is_running = False
         self._last_dl_dir = ""
+        self._stop_event = None
         self._saved_config = load_config()
         self._apply_style()
         self._build()
@@ -842,13 +1004,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         provider = self.provider_var.get()
         sf_custom = self._saved_config.get("custom_models", [])
         ark_custom = self._saved_config.get("ark_custom_models", [])
+        gemini_custom = self._saved_config.get("gemini_custom_models", [])
         cur = self.trans_model_var.get().strip()
         if provider == "siliconflow":
             if cur and cur not in DEFAULT_MODELS_SF and cur not in sf_custom:
                 sf_custom.append(cur)
-        else:
+        elif provider == "volcengine":
             if cur and cur not in DEFAULT_MODELS_ARK and cur not in ark_custom:
                 ark_custom.append(cur)
+        else:
+            if cur and cur not in DEFAULT_MODELS_GEMINI and cur not in gemini_custom:
+                gemini_custom.append(cur)
         save_config({
             "model_path": self.model_var.get().strip(),
             "device": self.device_var.get(),
@@ -863,6 +1029,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "ark_api_key": self.ark_key_var.get().strip(),
             "ark_model": self.trans_model_var.get().strip() if provider == "volcengine" else self._saved_config.get("ark_model", DEFAULT_MODELS_ARK[0]),
             "ark_custom_models": ark_custom,
+            "gemini_api_keys": self._gemini_key_text.get("1.0", "end").strip(),
+            "gemini_model": self.trans_model_var.get().strip() if provider == "gemini" else self._saved_config.get("gemini_model", DEFAULT_MODELS_GEMINI[0]),
+            "gemini_custom_models": gemini_custom,
+            "gemini_threads": self.gemini_threads_var.get().strip(),
             "translate_enabled": self.translate_var.get(),
             "batch_size": self.batch_var.get().strip(),
             "download_dir": self.dl_dir_var.get().strip(),
@@ -1018,7 +1188,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tk.Label(f_provider, text="翻译服务", bg="#1e1e1e", fg="#888888",
                  font=("Segoe UI", 9)).pack(side="left")
         self.provider_var = tk.StringVar(value=cfg.get("provider", "siliconflow"))
-        for val, txt in [("siliconflow", "硅基流动"), ("volcengine", "火山引擎 ARK")]:
+        for val, txt in [("siliconflow", "硅基流动"), ("volcengine", "火山引擎 ARK"), ("gemini", "Google Gemini")]:
             tk.Radiobutton(f_provider, text=txt, variable=self.provider_var, value=val,
                            bg="#1e1e1e", fg="#aaaaaa", selectcolor="#2d2d2d",
                            activebackground="#1e1e1e", font=("Segoe UI", 9),
@@ -1041,6 +1211,25 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                        font=("Segoe UI", 10), bd=4, show="*")
         self._ark_key_entry.grid(row=16, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
 
+        self._gemini_key_lbl = self._lbl(p, "Google Gemini API Key（每行一个，多个 Key 自动轮询）")
+        self._gemini_key_lbl.grid(row=15, column=0, sticky="w", padx=16, pady=(6, 0))
+        # Container: Text + threads row, all in column=0
+        self._gemini_key_frame = tk.Frame(p, bg="#1e1e1e")
+        self._gemini_key_frame.grid(row=16, column=0, sticky="ew", padx=16, pady=(2, 4))
+        self._gemini_key_frame.columnconfigure(0, weight=1)
+        self._gemini_key_text = tk.Text(self._gemini_key_frame, bg="#2d2d2d", fg="#ffffff",
+                                        insertbackground="white", relief="flat",
+                                        font=("Segoe UI", 10), bd=4, height=3)
+        self._gemini_key_text.insert("1.0", cfg.get("gemini_api_keys", ""))
+        self._gemini_key_text.grid(row=0, column=0, columnspan=2, sticky="ew")
+        tk.Label(self._gemini_key_frame, text="线程数", bg="#1e1e1e", fg="#888888",
+                 font=("Segoe UI", 9)).grid(row=1, column=0, sticky="w", pady=(5, 0))
+        self.gemini_threads_var = tk.StringVar(value=cfg.get("gemini_threads", "1"))
+        tk.Entry(self._gemini_key_frame, textvariable=self.gemini_threads_var, width=5,
+                 bg="#2d2d2d", fg="#ffffff", insertbackground="white", relief="flat",
+                 font=("Segoe UI", 10), bd=4).grid(row=1, column=1, sticky="w",
+                                                    padx=(8, 0), pady=(5, 0), ipady=3)
+
         self._lbl(p, "翻译模型（可手动输入新模型后回车保存）").grid(
             row=17, column=0, sticky="w", padx=16, pady=(2, 0))
         self.trans_model_var = tk.StringVar()
@@ -1058,11 +1247,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  insertbackground="white", relief="flat", font=("Segoe UI", 10),
                  bd=4).pack(side="left", padx=(8, 0), ipady=3)
 
-        self.btn = tk.Button(p, text="▶  开始", command=self._start,
+        f_btn_row = tk.Frame(p, bg="#1e1e1e")
+        f_btn_row.grid(row=20, column=0, pady=12)
+        self.btn = tk.Button(f_btn_row, text="▶  开始", command=self._start,
                              bg="#0078d4", fg="#ffffff", relief="flat",
                              font=("Segoe UI", 11, "bold"), padx=24, pady=8,
                              cursor="hand2", activebackground="#005fa3")
-        self.btn.grid(row=20, column=0, pady=12)
+        self.btn.pack(side="left")
+        self.stop_btn = tk.Button(f_btn_row, text="⏹  停止", command=self._stop,
+                                  bg="#555555", fg="#aaaaaa", relief="flat",
+                                  font=("Segoe UI", 11, "bold"), padx=24, pady=8,
+                                  cursor="hand2", activebackground="#666666", state="disabled")
+        self.stop_btn.pack(side="left", padx=(10, 0))
 
         p.rowconfigure(21, weight=1)
         self.log_box = scrolledtext.ScrolledText(p, bg="#111111", fg="#cccccc",
@@ -1131,20 +1327,27 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
     def _on_provider_change(self):
         provider = self.provider_var.get()
         cfg = self._saved_config
+        self._sf_key_lbl.grid_remove()
+        self._sf_key_entry.grid_remove()
+        self._ark_key_lbl.grid_remove()
+        self._ark_key_entry.grid_remove()
+        self._gemini_key_lbl.grid_remove()
+        self._gemini_key_frame.grid_remove()
         if provider == "siliconflow":
-            self._ark_key_lbl.grid_remove()
-            self._ark_key_entry.grid_remove()
             self._sf_key_lbl.grid()
             self._sf_key_entry.grid()
             models = DEFAULT_MODELS_SF + cfg.get("custom_models", [])
             saved_model = cfg.get("translate_model", DEFAULT_MODELS_SF[0])
-        else:
-            self._sf_key_lbl.grid_remove()
-            self._sf_key_entry.grid_remove()
+        elif provider == "volcengine":
             self._ark_key_lbl.grid()
             self._ark_key_entry.grid()
             models = DEFAULT_MODELS_ARK + cfg.get("ark_custom_models", [])
             saved_model = cfg.get("ark_model", DEFAULT_MODELS_ARK[0])
+        else:
+            self._gemini_key_lbl.grid()
+            self._gemini_key_frame.grid()
+            models = DEFAULT_MODELS_GEMINI + cfg.get("gemini_custom_models", [])
+            saved_model = cfg.get("gemini_model", DEFAULT_MODELS_GEMINI[0])
         self.trans_combo["values"] = models
         self.trans_model_var.set(saved_model if saved_model in models else models[0])
 
@@ -1157,7 +1360,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             current.append(val)
             self.trans_combo["values"] = current
             cfg = self._saved_config
-            key = "custom_models" if self.provider_var.get() == "siliconflow" else "ark_custom_models"
+            key = {"siliconflow": "custom_models", "volcengine": "ark_custom_models"}.get(self.provider_var.get(), "gemini_custom_models")
             custom = cfg.get(key, [])
             if val not in custom:
                 custom.append(val)
@@ -1244,23 +1447,36 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "provider": provider,
             "api_key": self.sf_key_var.get().strip(),
             "ark_api_key": self.ark_key_var.get().strip(),
+            "gemini_api_keys": self._gemini_key_text.get("1.0", "end").strip(),
+            "gemini_threads": self.gemini_threads_var.get().strip(),
             "translate_model": self.trans_model_var.get().strip() if provider == "siliconflow" else "",
             "ark_model": self.trans_model_var.get().strip() if provider == "volcengine" else "",
+            "gemini_model": self.trans_model_var.get().strip() if provider == "gemini" else "",
             "batch_size": batch_size,
         }
 
         self._do_save_config()
         self._is_running = True
+        self._stop_event = threading.Event()
         self.btn.configure(state="disabled", text="处理中...")
+        self.stop_btn.configure(state="normal")
         label = os.path.basename(srt_file) if srt_file else os.path.basename(video)
         self._log(f"▶ {label}")
 
+        stop_event = self._stop_event
+
         def task():
-            run_transcribe(config, self._log)
+            run_transcribe(config, self._log, stop_event)
             self._is_running = False
             self.btn.configure(state="normal", text="▶  开始")
+            self.stop_btn.configure(state="disabled", text="⏹  停止")
 
         threading.Thread(target=task, daemon=True).start()
+
+    def _stop(self):
+        if self._stop_event:
+            self._stop_event.set()
+        self.stop_btn.configure(state="disabled", text="停止中...")
 
     # ── 下载标签页事件 ──────────────────────────────────────────────────────────
 
