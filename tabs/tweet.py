@@ -39,7 +39,7 @@ class TweetTab(Tab):
         top.columnconfigure(0, weight=1)
         top.rowconfigure(1, weight=1)
 
-        tk.Label(top, text="  提示词配置", bg=BG, fg="#444444",
+        tk.Label(top, text="  提示词配置", bg=BG, fg="#555555",
                  font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w", padx=16, pady=(10, 0))
 
         pnb = ttk.Notebook(top)
@@ -49,22 +49,22 @@ class TweetTab(Tab):
         self._tweet_prompt_texts = []
 
         for i, pd in enumerate(prompts):
-            tab = tk.Frame(pnb, bg="#161616")
+            tab = tk.Frame(pnb, bg="#252525")
             tab.columnconfigure(1, weight=1)
             tab.rowconfigure(1, weight=1)
             pnb.add(tab, text=f"  {pd['name']}  ")
 
-            tk.Label(tab, text="名称", bg="#161616", fg="#555555",
+            tk.Label(tab, text="名称", bg="#252525", fg="#777777",
                      font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w",
                                                 padx=(14, 6), pady=(10, 6))
             name_var = tk.StringVar(value=pd["name"])
             self._tweet_prompt_name_vars.append(name_var)
-            tk.Entry(tab, textvariable=name_var, bg="#222222", fg="#bbbbbb",
-                     insertbackground="#888888", relief="flat",
+            tk.Entry(tab, textvariable=name_var, bg="#2d2d2d", fg="#cccccc",
+                     insertbackground="#aaaaaa", relief="flat",
                      font=("Segoe UI", 10), bd=3, highlightthickness=0).grid(
                 row=0, column=1, sticky="ew", padx=(0, 14), pady=(10, 6), ipady=4)
 
-            pt = tk.Text(tab, bg="#111111", fg="#cccccc", insertbackground="#888888",
+            pt = tk.Text(tab, bg="#1a1a1a", fg="#cccccc", insertbackground="#888888",
                          relief="flat", font=("Segoe UI", 10), bd=0,
                          wrap="word", padx=12, pady=10, height=4,
                          selectbackground="#1e3a5a", highlightthickness=0)
@@ -74,9 +74,9 @@ class TweetTab(Tab):
 
             idx = i
             tk.Button(tab, text="保 存", command=lambda i=idx: self._save_tweet_prompt(i),
-                      bg="#161616", fg="#505050", relief="flat", padx=14, pady=5,
+                      bg="#3a3a3a", fg="#aaaaaa", relief="flat", padx=14, pady=5,
                       font=("Segoe UI", 9), cursor="hand2",
-                      activebackground="#242424", activeforeground="#aaaaaa",
+                      activebackground="#484848", activeforeground="#cccccc",
                       bd=0).grid(row=2, column=1, sticky="e", padx=(0, 14), pady=(6, 10))
 
         pw.add(top, minsize=60, stretch="never")
@@ -110,22 +110,22 @@ class TweetTab(Tab):
 
         _bkw = dict(bg=BG, relief="flat", font=("Segoe UI", 9), cursor="hand2",
                     activebackground="#252525", bd=0, padx=4, pady=2)
-        tk.Button(f_right, text="A−", fg="#484848",
+        tk.Button(f_right, text="A−", fg="#666666",
                   command=lambda: self._update_tweet_font(-1), **_bkw).pack(side="left")
-        tk.Label(f_right, textvariable=self._tweet_font_size, bg=BG, fg="#3e3e3e",
+        tk.Label(f_right, textvariable=self._tweet_font_size, bg=BG, fg="#555555",
                  font=("Segoe UI", 9), width=2, anchor="center").pack(side="left")
-        tk.Button(f_right, text="A+", fg="#484848",
+        tk.Button(f_right, text="A+", fg="#666666",
                   command=lambda: self._update_tweet_font(1), **_bkw).pack(side="left")
 
         # Chat display
-        f_chat = tk.Frame(bottom, bg="#0c0c0c",
-                          highlightbackground=BG, highlightthickness=1)
+        f_chat = tk.Frame(bottom, bg="#141414",
+                          highlightbackground="#252525", highlightthickness=1)
         f_chat.grid(row=1, column=0, sticky="nsew", padx=16, pady=(8, 0))
         f_chat.columnconfigure(0, weight=1)
         f_chat.rowconfigure(0, weight=1)
 
         self._tweet_chat = tk.Text(
-            f_chat, bg="#0c0c0c", fg="#d8d8d8",
+            f_chat, bg="#141414", fg="#d8d8d8",
             insertbackground="white", relief="flat", font=("Segoe UI", fs), bd=0,
             wrap="word", padx=16, pady=14, spacing1=1, spacing3=1,
             selectbackground="#1e3a5a", selectforeground="#ffffff",
@@ -136,21 +136,21 @@ class TweetTab(Tab):
         # Thin 7px dark scrollbar
         chat_sb = tk.Scrollbar(
             f_chat, orient="vertical", command=self._tweet_chat.yview,
-            bg="#282828", activebackground="#383838", troughcolor="#0c0c0c",
+            bg="#3a3a3a", activebackground="#4a4a4a", troughcolor="#141414",
             relief="flat", bd=0, width=7, elementborderwidth=0, highlightthickness=0)
         chat_sb.grid(row=0, column=1, sticky="ns")
         self._tweet_chat.configure(yscrollcommand=chat_sb.set)
         self._apply_tweet_tags()
 
         # Input box
-        f_input_wrap = tk.Frame(bottom, bg="#1a1a1a",
-                                highlightbackground="#2a2a2a", highlightthickness=1)
+        f_input_wrap = tk.Frame(bottom, bg="#252525",
+                                highlightbackground="#3a3a3a", highlightthickness=1)
         f_input_wrap.grid(row=2, column=0, sticky="ew", padx=16, pady=(10, 0))
         f_input_wrap.columnconfigure(0, weight=1)
 
         self._tweet_input = tk.Text(
-            f_input_wrap, bg="#141414", fg="#d0d0d0",
-            insertbackground="#7a7a7a", relief="flat", font=("Segoe UI", 10),
+            f_input_wrap, bg="#252525", fg="#d0d0d0",
+            insertbackground="#aaaaaa", relief="flat", font=("Segoe UI", 10),
             bd=0, height=4, wrap="word", padx=14, pady=10, highlightthickness=0)
         self._tweet_input.grid(row=0, column=0, sticky="ew")
         self._tweet_input.bind("<Return>",
