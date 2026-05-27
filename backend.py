@@ -171,7 +171,8 @@ def _build_translate_prompt(lines, add_emoji):
             "你是专业字幕翻译，请将以下英文字幕翻译为中文，并为每行选一个最贴切的表情符号。\n\n"
             "要求：\n"
             "- 严格保持行号一一对应，不合并不拆分\n"
-            "- 每行输出格式：行号. 表情 中文翻译\n"
+            "- 每行输出格式：行号. 中文翻译|表情\n"
+            "- 竖线 | 作为分隔符，表情紧跟竖线之后\n"
             "- 只输出翻译结果，不要解释\n\n"
             f"字幕内容：\n{body}"
         )
@@ -186,7 +187,9 @@ def _build_translate_prompt(lines, add_emoji):
         )
 
 
-def _parse_translation(content, add_emoji=True):
+def _parse_translation(content):
+    """解析翻译结果，返回 {行号: (中文文本, 表情)}。
+    表情通过 | 分隔符提取，无表情时为空字符串。"""
     parsed = {}
     for line in content.split("\n"):
         line = line.strip()
@@ -196,17 +199,14 @@ def _parse_translation(content, add_emoji=True):
         if m:
             idx = int(m.group(1))
             rest = m.group(2).strip()
-            emoji = ""
-            text_part = rest
-            if add_emoji:
-                # 只有开启表情时才尝试提取首个非 ASCII 字符作为 emoji
-                for i, ch in enumerate(rest):
-                    if ord(ch) > 127:
-                        emoji = ch
-                        text_part = rest[i+1:].strip()
-                    break
-            text_part = text_part.rstrip("，。！？；：、…·")
-            parsed[idx] = (text_part, emoji)
+            if "|" in rest:
+                text, emoji = rest.rsplit("|", 1)
+                text = text.strip()
+                emoji = emoji.strip()
+            else:
+                text = rest
+                emoji = ""
+            parsed[idx] = (text, emoji)
     return parsed
 
 
@@ -249,7 +249,7 @@ def translate_batch(subs_batch, api_key, model, log, add_emoji=True):
             if attempt < 2:
                 time.sleep(3)
 
-    return _parse_translation(content, add_emoji) if content else {}
+    return _parse_translation(content) if content else {}
 
 
 def translate_batch_ark(subs_batch, api_key, model, log, add_emoji=True):
@@ -302,7 +302,7 @@ def translate_batch_ark(subs_batch, api_key, model, log, add_emoji=True):
             if attempt < 2:
                 time.sleep(3)
 
-    return _parse_translation(content, add_emoji) if content else {}
+    return _parse_translation(content) if content else {}
 
 
 def translate_batch_gemini(subs_batch, keys, start_key_idx, model, log, stop_event=None, add_emoji=True):
@@ -347,7 +347,7 @@ def translate_batch_gemini(subs_batch, keys, start_key_idx, model, log, stop_eve
                 for line in content.splitlines():
                     if line.strip():
                         log(f"    {line}")
-                return _parse_translation(content, add_emoji)
+                return _parse_translation(content)
             except urllib.error.HTTPError as e:
                 if e.code == 429:
                     log(f"  ⚠️ [{key_label}] 限速 (429)，切换下一个 Key...")
@@ -684,24 +684,27 @@ def run_transcribe(config, log, stop_event=None):
 
                 output_subs = []
                 if output_mode == "chinese_only":
-                    # 中文模式：每条原始段落翻译后，按 max_chars_zh 切分
+                    # 中文模式：翻译后按 max_chars_zh 切分，每段都附上相同 emoji
                     for sub in split_subs:
                         if sub.index in translations:
-                            zh, emoji = translations[sub.index]
-                            zh_text = f"{zh} {emoji}" if emoji else zh
+                            zh_text, emoji = translations[sub.index]
                         else:
-                            zh_text = sub.content  # 翻译失败保留原文
+                            zh_text, emoji = sub.content, ""  # 翻译失败保留原文
                         temp = srt.Subtitle(0, sub.start, sub.end, zh_text)
                         parts = srt_equalizer.split_subtitle(temp, max_chars_zh)
+                        if emoji:
+                            for part in parts:
+                                part.content = part.content.rstrip() + " " + emoji
                         output_subs.extend(parts)
                     for i, sub in enumerate(output_subs, 1):
                         sub.index = i
                 else:
-                    # 双语模式：英文已提前切分，直接合并中英文
+                    # 双语模式：英文已提前切分，中文直接合并（emoji 跟在中文末尾）
                     for sub in split_subs:
                         if sub.index in translations:
-                            zh, emoji = translations[sub.index]
-                            content = f"{zh} {emoji}\n{sub.content}" if emoji else f"{zh}\n{sub.content}"
+                            zh_text, emoji = translations[sub.index]
+                            zh_line = f"{zh_text} {emoji}" if emoji else zh_text
+                            content = f"{zh_line}\n{sub.content}"
                         else:
                             content = sub.content  # 翻译失败保留原文
                         output_subs.append(srt.Subtitle(
