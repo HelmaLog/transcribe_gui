@@ -6,7 +6,9 @@ import os
 from datetime import timedelta
 
 from .config import DEFAULT_MODELS_GEMINI
-from .translation import translate_batch, translate_batch_ark, translate_batch_gemini
+from .translation import (
+    translate_batch, translate_batch_ark, translate_batch_gemini, translate_batch_pioneer,
+)
 
 
 def _flatten_youtube_subs(subs, srt_mod):
@@ -70,6 +72,10 @@ def run_transcribe(config, log, stop_event=None):
             api_key = config.get("ark_api_key", "")
             translate_model = config.get("ark_model", "")
             translate_fn = translate_batch_ark
+        elif provider == "pioneer":
+            api_key = config.get("pioneer_api_key", "")
+            translate_model = config.get("pioneer_model", "")
+            translate_fn = translate_batch_pioneer
         else:
             raw_keys = config.get("gemini_api_keys", [])
             if isinstance(raw_keys, str):

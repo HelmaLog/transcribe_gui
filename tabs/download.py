@@ -415,7 +415,7 @@ class DownloadTab(Tab):
 
     def _begin_download(self, url, save_dir, title, fmt_opts):
         self.dl_btn.configure(state="disabled", text="下载中...")
-        _safe = re.sub(r'[\\/:*?"<>|]', '_', title).strip()[:40]
+        _safe = re.sub(r'[\\/:*?"<>|]', '_', title).strip()[:40].rstrip()
         self._last_dl_dir = os.path.normpath(os.path.join(save_dir, _safe))
 
         if fmt_opts.get('subtitle_only'):

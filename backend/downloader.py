@@ -109,7 +109,7 @@ def run_download(config, log, progress_cb=None):
         log(f"❌ 无法创建目录: {e}")
         return None
 
-    safe_title = re.sub(r'[\\/:*?"<>|]', '_', title).strip()[:40]
+    safe_title = re.sub(r'[\\/:*?"<>|]', '_', title).strip()[:40].rstrip()
     video_dir = os.path.join(save_dir, safe_title)
     os.makedirs(video_dir, exist_ok=True)
     log(f"📁 保存至: {video_dir}")

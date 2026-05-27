@@ -15,7 +15,8 @@ except ImportError:
     HAS_DND = False
 
 from backend import (
-    DEFAULT_MODELS_SF, DEFAULT_MODELS_ARK, DEFAULT_MODELS_GEMINI,
+    DEFAULT_MODELS_SF, DEFAULT_MODELS_ARK, DEFAULT_MODELS_GEMINI, DEFAULT_MODELS_PIONEER,
+    fetch_pioneer_models,
     run_transcribe,
 )
 from .base import Tab, BG
@@ -250,7 +251,10 @@ class TranscribeTab(Tab):
         tk.Label(f_provider, text="翻译服务", bg=BG, fg="#888888",
                  font=("Segoe UI", 9)).pack(side="left")
         self.provider_var = tk.StringVar(value=cfg.get("provider", "siliconflow"))
-        for val, txt in [("siliconflow", "硅基流动"), ("volcengine", "火山引擎 ARK"), ("gemini", "Google Gemini")]:
+        for val, txt in [
+            ("siliconflow", "硅基流动"), ("volcengine", "火山引擎 ARK"),
+            ("gemini", "Google Gemini"), ("pioneer", "Pioneer"),
+        ]:
             tk.Radiobutton(f_provider, text=txt, variable=self.provider_var, value=val,
                            bg=BG, fg="#aaaaaa", selectcolor="#252525",
                            activebackground=BG, font=("Segoe UI", 9),
@@ -282,12 +286,30 @@ class TranscribeTab(Tab):
         self._gemini_key_widget.grid(row=2, column=0, sticky="ew", padx=16, pady=(2, 4))
         self._gemini_key_widget.set_keys(cfg.get("gemini_api_keys", []))
 
-        # Model combo
-        self._lbl(tof, "翻译模型（可手动输入新模型后回车保存）").grid(
-            row=3, column=0, sticky="w", padx=16, pady=(2, 0))
+        # Pioneer key
+        self._pioneer_key_lbl = self._lbl(tof, "Pioneer API Key")
+        self._pioneer_key_lbl.grid(row=1, column=0, sticky="w", padx=16, pady=(6, 0))
+        self.pioneer_key_var = tk.StringVar(value=cfg.get("pioneer_api_key", ""))
+        self._pioneer_key_entry = tk.Entry(tof, textvariable=self.pioneer_key_var,
+                                           bg="#252525", fg="#aaaaaa",
+                                           insertbackground="white", relief="flat",
+                                           font=("Segoe UI", 10), bd=4, show="•")
+        self._pioneer_key_entry.grid(row=2, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
+
+        # Model label row (with optional fetch button for Pioneer)
+        f_model_hdr = tk.Frame(tof, bg=BG)
+        f_model_hdr.grid(row=3, column=0, sticky="ew", padx=16, pady=(2, 0))
+        self._lbl(f_model_hdr, "翻译模型（可手动输入新模型后回车保存）").pack(side="left")
+        self._pioneer_fetch_btn = tk.Button(
+            f_model_hdr, text="获取模型列表", command=self._fetch_pioneer_models,
+            bg="#3a3a3a", fg="#cccccc", relief="flat", padx=10, pady=1,
+            font=("Segoe UI", 9), cursor="hand2", activebackground="#4a4a4a",
+        )
+        self._pioneer_fetch_btn.pack(side="left", padx=(10, 0))
+
         self.trans_model_var = tk.StringVar()
         self.trans_combo = ttk.Combobox(tof, textvariable=self.trans_model_var,
-                                        font=("Segoe UI", 10))
+                                        font=("Segoe UI", 10), height=16)
         self.trans_combo.grid(row=4, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
         self.trans_combo.bind("<Return>", self._add_custom_model)
 
@@ -372,6 +394,9 @@ class TranscribeTab(Tab):
         self._ark_key_entry.grid_remove()
         self._gemini_key_lbl.grid_remove()
         self._gemini_key_widget.grid_remove()
+        self._pioneer_key_lbl.grid_remove()
+        self._pioneer_key_entry.grid_remove()
+        self._pioneer_fetch_btn.pack_forget()
         if provider == "siliconflow":
             self._sf_key_lbl.grid()
             self._sf_key_entry.grid()
@@ -382,13 +407,19 @@ class TranscribeTab(Tab):
             self._ark_key_entry.grid()
             models = DEFAULT_MODELS_ARK + cfg.get("ark_custom_models", [])
             saved_model = cfg.get("ark_model", DEFAULT_MODELS_ARK[0])
+        elif provider == "pioneer":
+            self._pioneer_key_lbl.grid()
+            self._pioneer_key_entry.grid()
+            self._pioneer_fetch_btn.pack(side="left", padx=(10, 0))
+            models = cfg.get("pioneer_custom_models", DEFAULT_MODELS_PIONEER)
+            saved_model = cfg.get("pioneer_model", models[0] if models else "")
         else:
             self._gemini_key_lbl.grid()
             self._gemini_key_widget.grid()
             models = DEFAULT_MODELS_GEMINI + cfg.get("gemini_custom_models", [])
             saved_model = cfg.get("gemini_model", DEFAULT_MODELS_GEMINI[0])
         self.trans_combo["values"] = models
-        self.trans_model_var.set(saved_model if saved_model in models else models[0])
+        self.trans_model_var.set(saved_model if saved_model in models else (models[0] if models else ""))
 
     def _add_custom_model(self, event=None):
         val = self.trans_model_var.get().strip()
@@ -399,13 +430,44 @@ class TranscribeTab(Tab):
             current.append(val)
             self.trans_combo["values"] = current
             cfg = self.app._saved_config
-            key = {"siliconflow": "custom_models", "volcengine": "ark_custom_models"}.get(
-                self.provider_var.get(), "gemini_custom_models")
+            key = {
+                "siliconflow": "custom_models",
+                "volcengine": "ark_custom_models",
+                "pioneer": "pioneer_custom_models",
+            }.get(self.provider_var.get(), "gemini_custom_models")
             custom = cfg.get(key, [])
             if val not in custom:
                 custom.append(val)
             cfg[key] = custom
             self._log(f"已添加模型: {val}")
+
+    def _fetch_pioneer_models(self):
+        key = self.pioneer_key_var.get().strip()
+        if not key:
+            self._log("❌ 请先填写 Pioneer API Key")
+            return
+        self._log("正在获取 Pioneer 模型列表...")
+
+        def _do_fetch():
+            models = fetch_pioneer_models(key)
+            if models is None:
+                self.app.after(0, lambda: self._log("❌ 获取失败，请检查 API Key 或网络连接"))
+            elif not models:
+                self.app.after(0, lambda: self._log("⚠️ 未找到可用的 LLM 模型"))
+            else:
+                def _update():
+                    cfg = self.app._saved_config
+                    cfg["pioneer_custom_models"] = models
+                    if not cfg.get("pioneer_model") or cfg["pioneer_model"] not in models:
+                        cfg["pioneer_model"] = models[0]
+                    self.trans_combo["values"] = models
+                    self.trans_model_var.set(cfg["pioneer_model"])
+                    self.app._do_save_config()
+                    self._log(f"✅ 获取到 {len(models)} 个模型（已保存）")
+                self.app.after(0, _update)
+
+        import threading
+        threading.Thread(target=_do_fetch, daemon=True).start()
 
     # ── File browsing / DnD ───────────────────────────────────────────────────
 
@@ -495,9 +557,11 @@ class TranscribeTab(Tab):
             "api_key": self.sf_key_var.get().strip(),
             "ark_api_key": self.ark_key_var.get().strip(),
             "gemini_api_keys": self._gemini_key_widget.get_keys(),
+            "pioneer_api_key": self.pioneer_key_var.get().strip(),
             "translate_model": self.trans_model_var.get().strip() if provider == "siliconflow" else "",
             "ark_model": self.trans_model_var.get().strip() if provider == "volcengine" else "",
             "gemini_model": self.trans_model_var.get().strip() if provider == "gemini" else "",
+            "pioneer_model": self.trans_model_var.get().strip() if provider == "pioneer" else "",
             "batch_size": batch_size,
             "translate_threads": self.threads_var.get().strip(),
             "add_emoji": self.emoji_var.get(),
@@ -544,6 +608,8 @@ class TranscribeTab(Tab):
             return self._gemini_key_widget.get_keys()
         elif provider == "siliconflow":
             return self.sf_key_var.get().strip()
+        elif provider == "pioneer":
+            return self.pioneer_key_var.get().strip()
         else:
             return self.ark_key_var.get().strip()
 
@@ -552,48 +618,62 @@ class TranscribeTab(Tab):
     def get_config(self):
         provider = self.provider_var.get()
         cfg = self.app._saved_config
-        sf_custom   = list(cfg.get("custom_models", []))
-        ark_custom  = list(cfg.get("ark_custom_models", []))
-        gem_custom  = list(cfg.get("gemini_custom_models", []))
+        sf_custom      = list(cfg.get("custom_models", []))
+        ark_custom     = list(cfg.get("ark_custom_models", []))
+        gem_custom     = list(cfg.get("gemini_custom_models", []))
+        pioneer_custom = list(cfg.get("pioneer_custom_models", []))
         cur = self.trans_model_var.get().strip()
         if provider == "siliconflow":
             if cur and cur not in DEFAULT_MODELS_SF and cur not in sf_custom:
                 sf_custom.append(cur)
             translate_model = cur
-            ark_model   = cfg.get("ark_model", DEFAULT_MODELS_ARK[0])
+            ark_model    = cfg.get("ark_model", DEFAULT_MODELS_ARK[0])
             gemini_model = cfg.get("gemini_model", DEFAULT_MODELS_GEMINI[0])
+            pioneer_model = cfg.get("pioneer_model", "")
         elif provider == "volcengine":
             if cur and cur not in DEFAULT_MODELS_ARK and cur not in ark_custom:
                 ark_custom.append(cur)
             translate_model = cfg.get("translate_model", DEFAULT_MODELS_SF[0])
-            ark_model   = cur
+            ark_model    = cur
             gemini_model = cfg.get("gemini_model", DEFAULT_MODELS_GEMINI[0])
+            pioneer_model = cfg.get("pioneer_model", "")
+        elif provider == "pioneer":
+            if cur and cur not in pioneer_custom:
+                pioneer_custom.append(cur)
+            translate_model = cfg.get("translate_model", DEFAULT_MODELS_SF[0])
+            ark_model    = cfg.get("ark_model", DEFAULT_MODELS_ARK[0])
+            gemini_model = cfg.get("gemini_model", DEFAULT_MODELS_GEMINI[0])
+            pioneer_model = cur
         else:
             if cur and cur not in DEFAULT_MODELS_GEMINI and cur not in gem_custom:
                 gem_custom.append(cur)
             translate_model = cfg.get("translate_model", DEFAULT_MODELS_SF[0])
-            ark_model   = cfg.get("ark_model", DEFAULT_MODELS_ARK[0])
+            ark_model    = cfg.get("ark_model", DEFAULT_MODELS_ARK[0])
             gemini_model = cur
+            pioneer_model = cfg.get("pioneer_model", "")
         return {
-            "model_path":       self.model_var.get().strip(),
-            "device":           self.device_var.get(),
-            "compute_type":     self.compute_var.get(),
-            "language":         self.lang_var.get().strip(),
-            "max_chars_en":     self.chars_var.get().strip(),
-            "max_chars_zh":     self.chars_zh_var.get().strip(),
-            "initial_prompt":   self.prompt_var.get(),
-            "provider":         provider,
-            "api_key":          self.sf_key_var.get().strip(),
-            "translate_model":  translate_model,
-            "custom_models":    sf_custom,
-            "ark_api_key":      self.ark_key_var.get().strip(),
-            "ark_model":        ark_model,
-            "ark_custom_models": ark_custom,
-            "gemini_api_keys":  self._gemini_key_widget.get_keys(),
-            "gemini_model":     gemini_model,
+            "model_path":          self.model_var.get().strip(),
+            "device":              self.device_var.get(),
+            "compute_type":        self.compute_var.get(),
+            "language":            self.lang_var.get().strip(),
+            "max_chars_en":        self.chars_var.get().strip(),
+            "max_chars_zh":        self.chars_zh_var.get().strip(),
+            "initial_prompt":      self.prompt_var.get(),
+            "provider":            provider,
+            "api_key":             self.sf_key_var.get().strip(),
+            "translate_model":     translate_model,
+            "custom_models":       sf_custom,
+            "ark_api_key":         self.ark_key_var.get().strip(),
+            "ark_model":           ark_model,
+            "ark_custom_models":   ark_custom,
+            "gemini_api_keys":     self._gemini_key_widget.get_keys(),
+            "gemini_model":        gemini_model,
             "gemini_custom_models": gem_custom,
-            "translate_threads": self.threads_var.get().strip(),
-            "add_emoji":        self.emoji_var.get(),
-            "output_mode":      self.output_mode_var.get(),
-            "batch_size":       self.batch_var.get().strip(),
+            "pioneer_api_key":     self.pioneer_key_var.get().strip(),
+            "pioneer_model":       pioneer_model,
+            "pioneer_custom_models": pioneer_custom,
+            "translate_threads":   self.threads_var.get().strip(),
+            "add_emoji":           self.emoji_var.get(),
+            "output_mode":         self.output_mode_var.get(),
+            "batch_size":          self.batch_var.get().strip(),
         }

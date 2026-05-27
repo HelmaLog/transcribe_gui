@@ -40,6 +40,8 @@ DEFAULT_MODELS_GEMINI = [
     "gemini-2.5-flash-lite",
 ]
 
+DEFAULT_MODELS_PIONEER = []  # populated at runtime via GET /base-models
+
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
 
 DEFAULT_CONFIG = {
@@ -61,6 +63,9 @@ DEFAULT_CONFIG = {
     "gemini_model": DEFAULT_MODELS_GEMINI[0],
     "gemini_custom_models": [],
     "gemini_threads": "1",
+    "pioneer_api_key": "",
+    "pioneer_model": "",
+    "pioneer_custom_models": [],
     "output_mode": "bilingual",
     "add_emoji": True,
     "translate_threads": "3",

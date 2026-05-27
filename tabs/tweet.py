@@ -3,11 +3,13 @@ Tweet / AI chat tab.
 """
 
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 
 from backend import (
-    DEFAULT_MODELS_SF, DEFAULT_MODELS_ARK, DEFAULT_MODELS_GEMINI, DEFAULT_CONFIG,
+    DEFAULT_MODELS_SF, DEFAULT_MODELS_ARK, DEFAULT_MODELS_GEMINI, DEFAULT_MODELS_PIONEER,
+    DEFAULT_CONFIG,
     chat_completion_stream,
 )
 from .base import Tab, BG
@@ -92,19 +94,16 @@ class TweetTab(Tab):
 
         # Provider radios
         self.tweet_provider_var = tk.StringVar(value=cfg.get("tweet_provider", "gemini"))
-        for val, txt in [("gemini", "Gemini"), ("siliconflow", "硅基"), ("volcengine", "ARK")]:
+        for val, txt in [
+            ("gemini", "Gemini"), ("siliconflow", "硅基"), ("volcengine", "ARK"), ("pioneer", "Pioneer"),
+        ]:
             tk.Radiobutton(f_hdr, text=txt, variable=self.tweet_provider_var, value=val,
                            bg=BG, fg="#666666", selectcolor=BG,
                            activebackground=BG, activeforeground="#aaaaaa",
                            font=("Segoe UI", 9),
                            command=self._on_tweet_provider_change).pack(side="left", padx=(0, 2))
 
-        self.tweet_model_var = tk.StringVar(value=cfg.get("tweet_model", DEFAULT_MODELS_GEMINI[0]))
-        self.tweet_model_combo = ttk.Combobox(f_hdr, textvariable=self.tweet_model_var,
-                                               font=("Segoe UI", 9), width=20)
-        self.tweet_model_combo.pack(side="left", padx=(8, 0))
-
-        # Right side: font controls + new conversation
+        # Right side: font controls — pack BEFORE combo so combo can expand into remaining space
         f_right = tk.Frame(f_hdr, bg=BG)
         f_right.pack(side="right")
 
@@ -116,6 +115,11 @@ class TweetTab(Tab):
                  font=("Segoe UI", 9), width=2, anchor="center").pack(side="left")
         tk.Button(f_right, text="A+", fg="#666666",
                   command=lambda: self._update_tweet_font(1), **_bkw).pack(side="left")
+
+        self.tweet_model_var = tk.StringVar(value=cfg.get("tweet_model", DEFAULT_MODELS_GEMINI[0]))
+        self.tweet_model_combo = ttk.Combobox(f_hdr, textvariable=self.tweet_model_var,
+                                               font=("Segoe UI", 9), height=16)
+        self.tweet_model_combo.pack(side="left", padx=(8, 8), fill="x", expand=True)
 
         # Chat display
         f_chat = tk.Frame(bottom, bg="#141414",
@@ -200,6 +204,9 @@ class TweetTab(Tab):
             "err_text", foreground="#d05050",
             font=(f, fs), spacing3=4)
         self._tweet_chat.tag_configure(
+            "timing", foreground="#4a4a4a",
+            font=(f, fs - 2), spacing3=2, lmargin1=4, lmargin2=4)
+        self._tweet_chat.tag_configure(
             "sep", foreground=BG,
             font=(f, 6), spacing1=4, spacing3=10)
 
@@ -221,12 +228,14 @@ class TweetTab(Tab):
             models = DEFAULT_MODELS_GEMINI + cfg.get("gemini_custom_models", [])
         elif provider == "siliconflow":
             models = DEFAULT_MODELS_SF + cfg.get("custom_models", [])
+        elif provider == "pioneer":
+            models = cfg.get("pioneer_custom_models", DEFAULT_MODELS_PIONEER)
         else:
             models = DEFAULT_MODELS_ARK + cfg.get("ark_custom_models", [])
         self.tweet_model_combo["values"] = models
         cur = self.tweet_model_var.get()
         if cur not in models:
-            self.tweet_model_var.set(models[0])
+            self.tweet_model_var.set(models[0] if models else "")
 
     # ── Prompt management ─────────────────────────────────────────────────────
 
@@ -294,21 +303,27 @@ class TweetTab(Tab):
 
         self._is_running = True
         self.tweet_send_btn.configure(state="disabled", text="···")
-        self._append_tweet("AI\n", "ai_hdr")
+        prompt_preview = (system_prompt[:30] + "…") if len(system_prompt) > 30 else system_prompt
+        hdr_text = f"AI  [{model}]" + (f"  |  提示词: {prompt_preview}" if system_prompt else "") + "\n"
+        self._append_tweet(hdr_text, "ai_hdr")
 
         def on_chunk(text):
             self.app.after(0, lambda t=text: self._stream_tweet_chunk(t))
 
         def task():
+            t0 = time.time()
             full_text, err = chat_completion_stream(
                 history, system_prompt, provider, api_key, model, on_chunk
             )
+            elapsed = time.time() - t0
             if err:
                 self.app.after(0, lambda: self._append_tweet(f"❌ {err}\n", "err_text"))
             else:
                 if full_text:
                     self._tweet_history.append({"role": "assistant", "content": full_text})
                 self.app.after(0, lambda: self._stream_tweet_chunk("\n"))
+            timing_str = f"⏱ {elapsed:.1f}s\n"
+            self.app.after(0, lambda: self._append_tweet(timing_str, "timing"))
             sep = "─" * 52 + "\n"
             self.app.after(0, lambda: self._append_tweet(sep, "sep"))
             self._is_running = False

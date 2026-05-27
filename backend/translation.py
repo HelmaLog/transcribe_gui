@@ -211,6 +211,69 @@ def translate_batch_gemini(subs_batch, keys, start_key_idx, model, log, stop_eve
     return {}
 
 
+def fetch_pioneer_models(api_key):
+    """Return list of model IDs from GET /base-models?task_type=decoder&supports_inference=true.
+    Returns None on error, [] on empty."""
+    import urllib.request
+    try:
+        url = "https://api.pioneer.ai/base-models?task_type=decoder&supports_inference=true"
+        req = urllib.request.Request(
+            url,
+            headers={"X-API-Key": api_key},
+            method="GET"
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if isinstance(data, list):
+            return [m["id"] for m in data if m.get("id")]
+        if isinstance(data, dict):
+            items = data.get("models") or data.get("data") or data.get("results") or []
+            return [m["id"] for m in items if m.get("id")]
+        return []
+    except Exception:
+        return None
+
+
+def translate_batch_pioneer(subs_batch, api_key, model, log, add_emoji=True):
+    import urllib.request
+
+    lines = [f"{sub.index}. {sub.content}" for sub in subs_batch]
+    prompt = _build_translate_prompt(lines, add_emoji)
+
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 2000,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.pioneer.ai/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST"
+    )
+
+    content = None
+    for attempt in range(3):
+        try:
+            log("  → 等待 Pioneer 响应...")
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                content = result["choices"][0]["message"]["content"].strip()
+            log("  ← 收到响应：")
+            for line in content.splitlines():
+                if line.strip():
+                    log(f"    {line}")
+            break
+        except Exception as e:
+            log(f"⚠️ 第{attempt+1}次请求失败: {e}，{'重试中...' if attempt < 2 else '跳过本批'}")
+            if attempt < 2:
+                time.sleep(3)
+
+    return _parse_translation(content) if content else {}
+
+
 def chat_completion_stream(messages, system_prompt, provider, api_key, model, on_chunk):
     """
     Streaming chat. Calls on_chunk(text) for each text chunk received.
@@ -325,6 +388,53 @@ def chat_completion_stream(messages, system_prompt, provider, api_key, model, on
                     except (KeyError, IndexError, json.JSONDecodeError):
                         pass
             return full_text, None
+        except Exception as e:
+            return None, str(e)
+
+    elif provider == "pioneer":
+        if not api_key:
+            return None, "未配置 Pioneer API Key，请在「转写」标签页中填写"
+        msgs = []
+        if system_prompt:
+            msgs.append({"role": "system", "content": system_prompt})
+        msgs.extend(messages)
+        payload = json.dumps({
+            "model": model,
+            "messages": msgs,
+            "temperature": 0.7,
+            "max_tokens": 4096,
+            "stream": True,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://api.pioneer.ai/v1/chat/completions",
+            data=payload,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8").rstrip("\r\n")
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        text = chunk["choices"][0]["delta"].get("content", "")
+                        if text:
+                            full_text += text
+                            on_chunk(text)
+                    except (KeyError, IndexError, json.JSONDecodeError):
+                        pass
+            return full_text, None
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode()
+                return None, f"HTTP {e.code}: {body}"
+            except Exception:
+                return None, f"HTTP {e.code}: {e.reason}"
         except Exception as e:
             return None, str(e)
 

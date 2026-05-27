@@ -1,10 +1,11 @@
 from .config import (
     load_config, save_config, DEFAULT_CONFIG,
-    DEFAULT_MODELS_SF, DEFAULT_MODELS_ARK, DEFAULT_MODELS_GEMINI,
+    DEFAULT_MODELS_SF, DEFAULT_MODELS_ARK, DEFAULT_MODELS_GEMINI, DEFAULT_MODELS_PIONEER,
 )
 from .common import _clean
 from .translation import (
     translate_batch, translate_batch_ark, translate_batch_gemini,
+    translate_batch_pioneer, fetch_pioneer_models,
     chat_completion_stream,
 )
 from .whisper import run_transcribe
