@@ -78,6 +78,7 @@ DEFAULT_CONFIG = {
     "gemini_custom_models": [],
     "gemini_threads": "1",
     "output_mode": "bilingual",
+    "add_emoji": True,
     "translate_threads": "3",
     "batch_size": "15",
     "download_dir": "",
@@ -163,7 +164,29 @@ def _flatten_youtube_subs(subs, srt_mod):
     return result
 
 
-def _parse_translation(content):
+def _build_translate_prompt(lines, add_emoji):
+    body = chr(10).join(lines)
+    if add_emoji:
+        return (
+            "你是专业字幕翻译，请将以下英文字幕翻译为中文，并为每行选一个最贴切的表情符号。\n\n"
+            "要求：\n"
+            "- 严格保持行号一一对应，不合并不拆分\n"
+            "- 每行输出格式：行号. 表情 中文翻译\n"
+            "- 只输出翻译结果，不要解释\n\n"
+            f"字幕内容：\n{body}"
+        )
+    else:
+        return (
+            "你是专业字幕翻译，请将以下英文字幕翻译为中文。\n\n"
+            "要求：\n"
+            "- 严格保持行号一一对应，不合并不拆分\n"
+            "- 每行输出格式：行号. 中文翻译\n"
+            "- 只输出翻译结果，不要解释\n\n"
+            f"字幕内容：\n{body}"
+        )
+
+
+def _parse_translation(content, add_emoji=True):
     parsed = {}
     for line in content.split("\n"):
         line = line.strip()
@@ -175,12 +198,12 @@ def _parse_translation(content):
             rest = m.group(2).strip()
             emoji = ""
             text_part = rest
-            for i, ch in enumerate(rest):
-                if ord(ch) > 127:
-                    emoji = ch
-                    text_part = rest[i+1:].strip()
-                    break
-                else:
+            if add_emoji:
+                # 只有开启表情时才尝试提取首个非 ASCII 字符作为 emoji
+                for i, ch in enumerate(rest):
+                    if ord(ch) > 127:
+                        emoji = ch
+                        text_part = rest[i+1:].strip()
                     break
             text_part = text_part.rstrip("，。！？；：、…·")
             parsed[idx] = (text_part, emoji)
@@ -189,19 +212,11 @@ def _parse_translation(content):
 
 # ── Translation functions ─────────────────────────────────────────────────────
 
-def translate_batch(subs_batch, api_key, model, log):
+def translate_batch(subs_batch, api_key, model, log, add_emoji=True):
     import urllib.request
 
     lines = [f"{sub.index}. {sub.content}" for sub in subs_batch]
-    prompt = f"""你是专业字幕翻译，请将以下英文字幕翻译为中文，并为每行选一个最贴切的表情符号。
-
-要求：
-- 严格保持行号一一对应，不合并不拆分
-- 每行输出格式：行号. 表情 中文翻译
-- 只输出翻译结果，不要解释
-
-字幕内容：
-{chr(10).join(lines)}"""
+    prompt = _build_translate_prompt(lines, add_emoji)
 
     payload = json.dumps({
         "model": model,
@@ -234,22 +249,14 @@ def translate_batch(subs_batch, api_key, model, log):
             if attempt < 2:
                 time.sleep(3)
 
-    return _parse_translation(content) if content else {}
+    return _parse_translation(content, add_emoji) if content else {}
 
 
-def translate_batch_ark(subs_batch, api_key, model, log):
+def translate_batch_ark(subs_batch, api_key, model, log, add_emoji=True):
     import urllib.request
 
     lines = [f"{sub.index}. {sub.content}" for sub in subs_batch]
-    prompt = f"""你是专业字幕翻译，请将以下英文字幕翻译为中文，并为每行选一个最贴切的表情符号。
-
-要求：
-- 严格保持行号一一对应，不合并不拆分
-- 每行输出格式：行号. 表情 中文翻译
-- 只输出翻译结果，不要解释
-
-字幕内容：
-{chr(10).join(lines)}"""
+    prompt = _build_translate_prompt(lines, add_emoji)
 
     payload = json.dumps({
         "model": model,
@@ -295,10 +302,10 @@ def translate_batch_ark(subs_batch, api_key, model, log):
             if attempt < 2:
                 time.sleep(3)
 
-    return _parse_translation(content) if content else {}
+    return _parse_translation(content, add_emoji) if content else {}
 
 
-def translate_batch_gemini(subs_batch, keys, start_key_idx, model, log, stop_event=None):
+def translate_batch_gemini(subs_batch, keys, start_key_idx, model, log, stop_event=None, add_emoji=True):
     import urllib.request
     import urllib.error
 
@@ -311,15 +318,7 @@ def translate_batch_gemini(subs_batch, keys, start_key_idx, model, log, stop_eve
         return False
 
     lines = [f"{sub.index}. {sub.content}" for sub in subs_batch]
-    prompt = f"""你是专业字幕翻译，请将以下英文字幕翻译为中文，并为每行选一个最贴切的表情符号。
-
-要求：
-- 严格保持行号一一对应，不合并不拆分
-- 每行输出格式：行号. 表情 中文翻译
-- 只输出翻译结果，不要解释
-
-字幕内容：
-{chr(10).join(lines)}"""
+    prompt = _build_translate_prompt(lines, add_emoji)
 
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
@@ -348,7 +347,7 @@ def translate_batch_gemini(subs_batch, keys, start_key_idx, model, log, stop_eve
                 for line in content.splitlines():
                     if line.strip():
                         log(f"    {line}")
-                return _parse_translation(content)
+                return _parse_translation(content, add_emoji)
             except urllib.error.HTTPError as e:
                 if e.code == 429:
                     log(f"  ⚠️ [{key_label}] 限速 (429)，切换下一个 Key...")
@@ -642,15 +641,17 @@ def run_transcribe(config, log, stop_event=None):
                 log("❌ 未填写 API Key，跳过翻译")
             else:
                 from concurrent.futures import ThreadPoolExecutor, as_completed
+                add_emoji = config.get("add_emoji", True)
                 batches = [split_subs[i:i+batch_size] for i in range(0, len(split_subs), batch_size)]
                 provider_name = {
                     "siliconflow": "硅基流动",
                     "volcengine": "火山引擎 ARK",
                 }.get(provider, "Google Gemini")
                 mode_name = "中文" if output_mode == "chinese_only" else "双语"
+                emoji_tag = "" if add_emoji else "（无表情）"
 
                 concurrency = max(1, int(config.get("translate_threads", 3)))
-                log(f"开始翻译（{mode_name}），{provider_name} / {translate_model}，"
+                log(f"开始翻译（{mode_name}{emoji_tag}），{provider_name} / {translate_model}，"
                     f"每批 {batch_size} 行，共 {len(batches)} 批，{concurrency} 路并发...")
                 translations = {}
                 stopped = False
@@ -660,13 +661,13 @@ def run_transcribe(config, log, stop_event=None):
                         future_to_bi = {
                             executor.submit(
                                 translate_batch_gemini, batch, gemini_keys,
-                                bi % len(gemini_keys), translate_model, log, stop_event
+                                bi % len(gemini_keys), translate_model, log, stop_event, add_emoji
                             ): bi
                             for bi, batch in enumerate(batches)
                         }
                     else:
                         future_to_bi = {
-                            executor.submit(translate_fn, batch, api_key, translate_model, log): bi
+                            executor.submit(translate_fn, batch, api_key, translate_model, log, add_emoji): bi
                             for bi, batch in enumerate(batches)
                         }
                     for future in as_completed(future_to_bi):

@@ -509,6 +509,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                              else self._saved_config.get("gemini_model", DEFAULT_MODELS_GEMINI[0])),
             "gemini_custom_models": gemini_custom,
             "translate_threads": self.threads_var.get().strip(),
+            "add_emoji": self.emoji_var.get(),
             "output_mode": self.output_mode_var.get(),
             "batch_size": self.batch_var.get().strip(),
             "download_dir": self.dl_dir_var.get().strip(),
@@ -748,6 +749,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         tk.Entry(f_batch, textvariable=self.threads_var, width=4, bg="#2d2d2d", fg="#ffffff",
                  insertbackground="white", relief="flat", font=("Segoe UI", 10),
                  bd=4).pack(side="left", padx=(8, 0), ipady=3)
+        self.emoji_var = tk.BooleanVar(value=cfg.get("add_emoji", True))
+        tk.Checkbutton(f_batch, text="添加表情", variable=self.emoji_var,
+                       bg="#1e1e1e", fg="#888888", selectcolor="#2d2d2d",
+                       activebackground="#1e1e1e", font=("Segoe UI", 9),
+                       ).pack(side="left", padx=(18, 0))
 
         # ── 按钮行 ──
         f_btn_row = tk.Frame(p, bg="#1e1e1e")
@@ -1136,6 +1142,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "gemini_model": self.trans_model_var.get().strip() if provider == "gemini" else "",
             "batch_size": batch_size,
             "translate_threads": self.threads_var.get().strip(),
+            "add_emoji": self.emoji_var.get(),
         }
 
         self._do_save_config()
