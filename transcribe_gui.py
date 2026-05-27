@@ -500,7 +500,8 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "device": self.device_var.get(),
             "compute_type": self.compute_var.get(),
             "language": self.lang_var.get().strip(),
-            "max_chars": self.chars_var.get().strip(),
+            "max_chars_en": self.chars_var.get().strip(),
+            "max_chars_zh": self.chars_zh_var.get().strip(),
             "initial_prompt": self.prompt_var.get(),
             "provider": provider,
             "api_key": self.sf_key_var.get().strip(),
@@ -519,7 +520,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                              else self._saved_config.get("gemini_model", DEFAULT_MODELS_GEMINI[0])),
             "gemini_custom_models": gemini_custom,
             "gemini_threads": self.gemini_threads_var.get().strip(),
-            "translate_enabled": self.translate_var.get(),
+            "output_mode": self.output_mode_var.get(),
             "batch_size": self.batch_var.get().strip(),
             "download_dir": self.dl_dir_var.get().strip(),
             "tweet_provider": self.tweet_provider_var.get(),
@@ -660,9 +661,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         olbl("语言")
         self.lang_var = tk.StringVar(value=cfg["language"])
         oentry(self.lang_var, 5)
-        olbl("最大字符数")
-        self.chars_var = tk.StringVar(value=cfg["max_chars"])
+        olbl("英文切分")
+        self.chars_var = tk.StringVar(value=cfg.get("max_chars_en", cfg.get("max_chars", "42")))
         oentry(self.chars_var, 5)
+        olbl("中文切分")
+        self.chars_zh_var = tk.StringVar(value=cfg.get("max_chars_zh", "20"))
+        oentry(self.chars_zh_var, 5)
 
         self._lbl(p, "初始提示词（可选）").grid(row=10, column=0, sticky="w", padx=16, pady=(2, 0))
         self.prompt_var = tk.StringVar(value=cfg["initial_prompt"])
@@ -676,14 +680,27 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         f_trans_title.grid(row=13, column=0, sticky="ew", padx=16, pady=(6, 0))
         tk.Label(f_trans_title, text="  翻 译", bg="#1e1e1e", fg="#555555",
                  font=("Segoe UI", 8)).pack(side="left")
-        self.translate_var = tk.BooleanVar(value=cfg.get("translate_enabled", False))
-        tk.Checkbutton(f_trans_title, text="启用双语翻译", variable=self.translate_var,
-                       bg="#1e1e1e", fg="#aaaaaa", selectcolor="#2d2d2d",
-                       activebackground="#1e1e1e", font=("Segoe UI", 9)
-                       ).pack(side="left", padx=(16, 0))
+        self.output_mode_var = tk.StringVar(value=cfg.get("output_mode", "bilingual"))
+        for i, (val, txt) in enumerate([
+            ("english_only", "只生成英文"),
+            ("bilingual",    "双语（中英）"),
+            ("chinese_only", "只生成中文"),
+        ]):
+            tk.Radiobutton(
+                f_trans_title, text=txt, variable=self.output_mode_var, value=val,
+                bg="#1e1e1e", fg="#aaaaaa", selectcolor="#2d2d2d",
+                activebackground="#1e1e1e", font=("Segoe UI", 9),
+                command=self._on_output_mode_change,
+            ).pack(side="left", padx=(16 if i == 0 else 6, 0))
 
-        f_provider = tk.Frame(p, bg="#1e1e1e")
-        f_provider.grid(row=14, column=0, sticky="w", padx=16, pady=(4, 0))
+        # ── 翻译选项区（选"只生成英文"时自动折叠）──
+        self._trans_opts = tk.Frame(p, bg="#1e1e1e")
+        self._trans_opts.grid(row=14, column=0, sticky="ew")
+        self._trans_opts.columnconfigure(0, weight=1)
+        tof = self._trans_opts
+
+        f_provider = tk.Frame(tof, bg="#1e1e1e")
+        f_provider.grid(row=0, column=0, sticky="w", padx=16, pady=(4, 0))
         tk.Label(f_provider, text="翻译服务", bg="#1e1e1e", fg="#888888",
                  font=("Segoe UI", 9)).pack(side="left")
         self.provider_var = tk.StringVar(value=cfg.get("provider", "siliconflow"))
@@ -695,42 +712,42 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                            ).pack(side="left", padx=(12, 0))
 
         # SF key
-        self._sf_key_lbl = self._lbl(p, "硅基流动 API Key")
-        self._sf_key_lbl.grid(row=15, column=0, sticky="w", padx=16, pady=(6, 0))
+        self._sf_key_lbl = self._lbl(tof, "硅基流动 API Key")
+        self._sf_key_lbl.grid(row=1, column=0, sticky="w", padx=16, pady=(6, 0))
         self.sf_key_var = tk.StringVar(value=cfg.get("api_key", ""))
-        self._sf_key_entry = tk.Entry(p, textvariable=self.sf_key_var, bg="#2d2d2d", fg="#ffffff",
+        self._sf_key_entry = tk.Entry(tof, textvariable=self.sf_key_var, bg="#2d2d2d", fg="#ffffff",
                                       insertbackground="white", relief="flat",
                                       font=("Segoe UI", 10), bd=4, show="•")
-        self._sf_key_entry.grid(row=16, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
+        self._sf_key_entry.grid(row=2, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
 
         # ARK key
-        self._ark_key_lbl = self._lbl(p, "火山引擎 ARK API Key")
-        self._ark_key_lbl.grid(row=15, column=0, sticky="w", padx=16, pady=(6, 0))
+        self._ark_key_lbl = self._lbl(tof, "火山引擎 ARK API Key")
+        self._ark_key_lbl.grid(row=1, column=0, sticky="w", padx=16, pady=(6, 0))
         self.ark_key_var = tk.StringVar(value=cfg.get("ark_api_key", ""))
-        self._ark_key_entry = tk.Entry(p, textvariable=self.ark_key_var, bg="#2d2d2d", fg="#ffffff",
+        self._ark_key_entry = tk.Entry(tof, textvariable=self.ark_key_var, bg="#2d2d2d", fg="#ffffff",
                                        insertbackground="white", relief="flat",
                                        font=("Segoe UI", 10), bd=4, show="•")
-        self._ark_key_entry.grid(row=16, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
+        self._ark_key_entry.grid(row=2, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
 
         # Gemini key widget
-        self._gemini_key_lbl = self._lbl(p, "Google Gemini API Key（每个 Key 一行，多 Key 自动轮询）")
-        self._gemini_key_lbl.grid(row=15, column=0, sticky="w", padx=16, pady=(6, 0))
+        self._gemini_key_lbl = self._lbl(tof, "Google Gemini API Key（每个 Key 一行，多 Key 自动轮询）")
+        self._gemini_key_lbl.grid(row=1, column=0, sticky="w", padx=16, pady=(6, 0))
         self.gemini_threads_var = tk.StringVar(value=cfg.get("gemini_threads", "1"))
-        self._gemini_key_widget = GeminiKeyListWidget(p, self.gemini_threads_var)
-        self._gemini_key_widget.grid(row=16, column=0, sticky="ew", padx=16, pady=(2, 4))
+        self._gemini_key_widget = GeminiKeyListWidget(tof, self.gemini_threads_var)
+        self._gemini_key_widget.grid(row=2, column=0, sticky="ew", padx=16, pady=(2, 4))
         self._gemini_key_widget.set_keys(cfg.get("gemini_api_keys", []))
 
         # Model combo
-        self._lbl(p, "翻译模型（可手动输入新模型后回车保存）").grid(
-            row=17, column=0, sticky="w", padx=16, pady=(2, 0))
+        self._lbl(tof, "翻译模型（可手动输入新模型后回车保存）").grid(
+            row=3, column=0, sticky="w", padx=16, pady=(2, 0))
         self.trans_model_var = tk.StringVar()
-        self.trans_combo = ttk.Combobox(p, textvariable=self.trans_model_var,
-                                         font=("Segoe UI", 10))
-        self.trans_combo.grid(row=18, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
+        self.trans_combo = ttk.Combobox(tof, textvariable=self.trans_model_var,
+                                        font=("Segoe UI", 10))
+        self.trans_combo.grid(row=4, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
         self.trans_combo.bind("<Return>", self._add_custom_model)
 
-        f_batch = tk.Frame(p, bg="#1e1e1e")
-        f_batch.grid(row=19, column=0, sticky="w", padx=16, pady=(2, 4))
+        f_batch = tk.Frame(tof, bg="#1e1e1e")
+        f_batch.grid(row=5, column=0, sticky="w", padx=16, pady=(2, 6))
         tk.Label(f_batch, text="每批翻译行数", bg="#1e1e1e", fg="#888888",
                  font=("Segoe UI", 9)).pack(side="left")
         self.batch_var = tk.StringVar(value=cfg.get("batch_size", "15"))
@@ -738,8 +755,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  insertbackground="white", relief="flat", font=("Segoe UI", 10),
                  bd=4).pack(side="left", padx=(8, 0), ipady=3)
 
+        # ── 按钮行 ──
         f_btn_row = tk.Frame(p, bg="#1e1e1e")
-        f_btn_row.grid(row=20, column=0, pady=12)
+        f_btn_row.grid(row=15, column=0, pady=10)
         self.btn = tk.Button(f_btn_row, text="▶  开始", command=self._start,
                              bg="#0078d4", fg="#ffffff", relief="flat",
                              font=("Segoe UI", 11, "bold"), padx=24, pady=8,
@@ -750,14 +768,22 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                                   font=("Segoe UI", 11, "bold"), padx=24, pady=8,
                                   cursor="hand2", activebackground="#666666", state="disabled")
         self.stop_btn.pack(side="left", padx=(10, 0))
+        self._open_folder_btn = tk.Button(
+            f_btn_row, text="📂  打开目录", command=self._open_output_folder,
+            bg="#3a3a3a", fg="#aaaaaa", relief="flat",
+            font=("Segoe UI", 11), padx=18, pady=8,
+            cursor="hand2", activebackground="#4a4a4a", state="disabled")
+        self._open_folder_btn.pack(side="left", padx=(10, 0))
 
-        p.rowconfigure(21, weight=1)
+        p.rowconfigure(16, weight=1)
         self.log_box = scrolledtext.ScrolledText(p, bg="#111111", fg="#cccccc",
                                                   font=("Consolas", 9), relief="flat",
                                                   state="disabled", height=10)
-        self.log_box.grid(row=21, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        self.log_box.grid(row=16, column=0, sticky="nsew", padx=16, pady=(0, 16))
 
+        self._last_output_dir = ""
         self._on_provider_change()
+        self._on_output_mode_change()
 
     # ── Download tab ──────────────────────────────────────────────────────────
 
@@ -977,6 +1003,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     # ── Transcribe tab events ─────────────────────────────────────────────────
 
+    def _on_output_mode_change(self):
+        pass  # 翻译配置区常驻，不折叠，避免切换时界面跳动
+
     def _on_provider_change(self):
         provider = self.provider_var.get()
         cfg = self._saved_config
@@ -1077,9 +1106,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             return
 
         try:
-            max_chars = int(self.chars_var.get())
+            max_chars_en = int(self.chars_var.get())
         except ValueError:
-            self._log("❌ 字符数请填整数")
+            self._log("❌ 英文切分字符数请填整数")
+            return
+        try:
+            max_chars_zh = int(self.chars_zh_var.get())
+        except ValueError:
+            self._log("❌ 中文切分字符数请填整数")
             return
         try:
             batch_size = int(self.batch_var.get())
@@ -1094,10 +1128,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "device": self.device_var.get(),
             "compute_type": self.compute_var.get(),
             "language": self.lang_var.get().strip(),
-            "max_chars": max_chars,
+            "max_chars_en": max_chars_en,
+            "max_chars_zh": max_chars_zh,
             "initial_prompt": self.prompt_var.get(),
             "save_path": self.save_var.get().strip(),
-            "translate_enabled": self.translate_var.get(),
+            "output_mode": self.output_mode_var.get(),
             "provider": provider,
             "api_key": self.sf_key_var.get().strip(),
             "ark_api_key": self.ark_key_var.get().strip(),
@@ -1114,14 +1149,18 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._stop_event = threading.Event()
         self.btn.configure(state="disabled", text="处理中...")
         self.stop_btn.configure(state="normal")
+        self._open_folder_btn.configure(state="disabled")
         label = os.path.basename(srt_file) if srt_file else os.path.basename(video)
         self._log(f"▶ {label}")
 
         stop_event = self._stop_event
 
         def task():
-            run_transcribe(config, self._log, stop_event)
+            result_dir = run_transcribe(config, self._log, stop_event)
             self._is_running = False
+            if result_dir:
+                self._last_output_dir = result_dir
+                self._open_folder_btn.configure(state="normal")
             self.btn.configure(state="normal", text="▶  开始")
             self.stop_btn.configure(state="disabled", text="⏹  停止")
 
@@ -1131,6 +1170,14 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         if self._stop_event:
             self._stop_event.set()
         self.stop_btn.configure(state="disabled", text="停止中...")
+
+    def _open_output_folder(self):
+        folder = self._last_output_dir
+        if not folder or not os.path.isdir(folder):
+            self._log("❌ 输出目录不存在，请先执行一次转写")
+            return
+        self._log(f"📂 打开: {folder}")
+        os.startfile(folder)
 
     # ── Download tab events ───────────────────────────────────────────────────
 

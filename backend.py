@@ -63,7 +63,8 @@ DEFAULT_CONFIG = {
     "device": "cuda",
     "compute_type": "int8",
     "language": "en",
-    "max_chars": "42",
+    "max_chars_en": "42",
+    "max_chars_zh": "20",
     "initial_prompt": "",
     "provider": "siliconflow",
     "api_key": "",
@@ -76,7 +77,7 @@ DEFAULT_CONFIG = {
     "gemini_model": DEFAULT_MODELS_GEMINI[0],
     "gemini_custom_models": [],
     "gemini_threads": "1",
-    "translate_enabled": False,
+    "output_mode": "bilingual",
     "batch_size": "15",
     "download_dir": "",
     "tweet_provider": "gemini",
@@ -101,6 +102,12 @@ def load_config():
                 if isinstance(cfg.get("gemini_api_keys"), str):
                     old = cfg["gemini_api_keys"]
                     cfg["gemini_api_keys"] = [k.strip() for k in old.splitlines() if k.strip()]
+                # Backward compat: translate_enabled → output_mode
+                if "translate_enabled" in cfg and "output_mode" not in cfg:
+                    cfg["output_mode"] = "bilingual" if cfg.get("translate_enabled") else "english_only"
+                # Backward compat: max_chars → max_chars_en
+                if "max_chars" in cfg and "max_chars_en" not in cfg:
+                    cfg["max_chars_en"] = cfg["max_chars"]
                 # Ensure tweet_prompts has exactly 3 items
                 prompts = cfg.get("tweet_prompts", [])
                 while len(prompts) < 3:
@@ -491,10 +498,14 @@ def run_transcribe(config, log, stop_event=None):
         device = config["device"]
         compute_type = config["compute_type"]
         language = config["language"]
-        max_chars = config["max_chars"]
         initial_prompt = config["initial_prompt"]
         save_path = config["save_path"]
-        translate_enabled = config["translate_enabled"]
+        output_mode = config.get("output_mode", "bilingual")
+        # 向前兼容旧配置
+        if "output_mode" not in config and "translate_enabled" in config:
+            output_mode = "bilingual" if config["translate_enabled"] else "english_only"
+        max_chars_en = int(config.get("max_chars_en", config.get("max_chars", 42)))
+        max_chars_zh = int(config.get("max_chars_zh", 20))
         provider = config.get("provider", "siliconflow")
 
         if provider == "siliconflow":
@@ -524,13 +535,20 @@ def run_transcribe(config, log, stop_event=None):
                 raw_subs = list(srt.parse(f.read()))
             log(f"已加载 {len(raw_subs)} 条字幕，处理 YouTube 滚动字幕格式...")
             raw_subs = _flatten_youtube_subs(raw_subs, srt)
-            log(f"展开后 {len(raw_subs)} 条，开始按 {max_chars} 字符切分...")
-            split_subs = []
-            for sub in raw_subs:
-                split_subs.extend(srt_equalizer.split_subtitle(sub, max_chars))
-            for i, sub in enumerate(split_subs, 1):
-                sub.index = i
-            log(f"切分完成，共 {len(split_subs)} 条")
+            log(f"展开后 {len(raw_subs)} 条")
+            if output_mode == "chinese_only":
+                log("中文模式：保留原始段落，翻译后按中文字数切分")
+                for i, sub in enumerate(raw_subs, 1):
+                    sub.index = i
+                split_subs = raw_subs
+            else:
+                log(f"开始按 {max_chars_en} 字符切分...")
+                split_subs = []
+                for sub in raw_subs:
+                    split_subs.extend(srt_equalizer.split_subtitle(sub, max_chars_en))
+                for i, sub in enumerate(split_subs, 1):
+                    sub.index = i
+                log(f"切分完成，共 {len(split_subs)} 条")
 
             srt_stem = os.path.splitext(os.path.basename(srt_path))[0]
             if srt_stem.endswith("_英文"):
@@ -576,12 +594,20 @@ def run_transcribe(config, log, stop_event=None):
                 if i % 10 == 0:
                     log(f"已识别 {i} 段，进度: {seg.start:.1f}s / {info.duration:.1f}s")
 
-            log(f"识别完成，共 {len(subs)} 段，开始切分...")
-            split_subs = []
-            for sub in subs:
-                split_subs.extend(srt_equalizer.split_subtitle(sub, max_chars))
-            for i, sub in enumerate(split_subs, 1):
-                sub.index = i
+            log(f"识别完成，共 {len(subs)} 段")
+            if output_mode == "chinese_only":
+                log("中文模式：保留原始段落，翻译后按中文字数切分")
+                for i, sub in enumerate(subs, 1):
+                    sub.index = i
+                split_subs = subs
+            else:
+                log(f"开始按 {max_chars_en} 字符切分...")
+                split_subs = []
+                for sub in subs:
+                    split_subs.extend(srt_equalizer.split_subtitle(sub, max_chars_en))
+                for i, sub in enumerate(split_subs, 1):
+                    sub.index = i
+                log(f"切分完成，共 {len(split_subs)} 条")
 
             video_stem = os.path.splitext(os.path.basename(video_path))[0]
             clean_name = _re.sub(r"[^\w\s]", " ", video_stem).strip()
@@ -598,15 +624,18 @@ def run_transcribe(config, log, stop_event=None):
 
         base_path = os.path.join(save_dir, short_name)
 
-        if not use_existing_srt:
+        # ── 保存英文字幕 ──
+        # 从视频转写时始终保存；使用现有 SRT 且模式为"只生成英文"时也保存
+        if not use_existing_srt or output_mode == "english_only":
             en_path = base_path + "_英文.srt"
             with open(en_path, "w", encoding="utf-8") as f:
                 f.write(srt.compose(split_subs))
             log(f"✅ 英文字幕已保存: {en_path}")
 
-        if translate_enabled:
+        # ── 翻译并保存中文 / 双语字幕 ──
+        if output_mode != "english_only":
             if not api_key.strip():
-                log("❌ 未填写API Key，跳过翻译")
+                log("❌ 未填写 API Key，跳过翻译")
             else:
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 batches = [split_subs[i:i+batch_size] for i in range(0, len(split_subs), batch_size)]
@@ -614,9 +643,11 @@ def run_transcribe(config, log, stop_event=None):
                     "siliconflow": "硅基流动",
                     "volcengine": "火山引擎 ARK",
                 }.get(provider, "Google Gemini")
+                mode_name = "中文" if output_mode == "chinese_only" else "双语"
 
                 concurrency = max(1, int(config.get("gemini_threads", 1))) if provider == "gemini" else 3
-                log(f"开始翻译，{provider_name} / {translate_model}，每批 {batch_size} 行，共 {len(batches)} 批，{concurrency} 路并发...")
+                log(f"开始翻译（{mode_name}），{provider_name} / {translate_model}，"
+                    f"每批 {batch_size} 行，共 {len(batches)} 批，{concurrency} 路并发...")
                 translations = {}
                 stopped = False
 
@@ -646,30 +677,50 @@ def run_transcribe(config, log, stop_event=None):
                             stopped = True
                             break
 
-                bilingual_subs = []
-                for sub in split_subs:
-                    if sub.index in translations:
-                        zh, emoji = translations[sub.index]
-                        content = f"{zh} {emoji}\n{sub.content}" if emoji else f"{zh}\n{sub.content}"
-                    else:
-                        content = sub.content
-                    bilingual_subs.append(srt.Subtitle(
-                        index=sub.index, start=sub.start, end=sub.end, content=content,
-                    ))
-
-                suffix = "_部分双语" if stopped else "_双语"
-                bi_path = base_path + suffix + ".srt"
-                with open(bi_path, "w", encoding="utf-8") as f:
-                    f.write(srt.compose(bilingual_subs))
-                if stopped:
-                    log(f"⏹ 已停止，部分双语字幕已保存（{len(translations)}/{len(split_subs)} 行）: {bi_path}")
+                output_subs = []
+                if output_mode == "chinese_only":
+                    # 中文模式：每条原始段落翻译后，按 max_chars_zh 切分
+                    for sub in split_subs:
+                        if sub.index in translations:
+                            zh, emoji = translations[sub.index]
+                            zh_text = f"{zh} {emoji}" if emoji else zh
+                        else:
+                            zh_text = sub.content  # 翻译失败保留原文
+                        temp = srt.Subtitle(0, sub.start, sub.end, zh_text)
+                        parts = srt_equalizer.split_subtitle(temp, max_chars_zh)
+                        output_subs.extend(parts)
+                    for i, sub in enumerate(output_subs, 1):
+                        sub.index = i
                 else:
-                    log(f"✅ 双语字幕已保存: {bi_path}")
+                    # 双语模式：英文已提前切分，直接合并中英文
+                    for sub in split_subs:
+                        if sub.index in translations:
+                            zh, emoji = translations[sub.index]
+                            content = f"{zh} {emoji}\n{sub.content}" if emoji else f"{zh}\n{sub.content}"
+                        else:
+                            content = sub.content  # 翻译失败保留原文
+                        output_subs.append(srt.Subtitle(
+                            index=sub.index, start=sub.start, end=sub.end, content=content,
+                        ))
+
+                if output_mode == "chinese_only":
+                    suffix = "_部分中文" if stopped else "_中文"
+                else:
+                    suffix = "_部分双语" if stopped else "_双语"
+                out_path = base_path + suffix + ".srt"
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(srt.compose(output_subs))
+                if stopped:
+                    log(f"⏹ 已停止，部分{mode_name}字幕已保存（{len(translations)}/{len(split_subs)} 行）: {out_path}")
+                else:
+                    log(f"✅ {mode_name}字幕已保存: {out_path}")
 
         if stop_event and stop_event.is_set():
             log("⏹ 任务已停止")
         else:
             log("🎉 全部完成！")
+
+        return save_dir
 
     except Exception as e:
         import traceback
