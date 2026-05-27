@@ -353,15 +353,20 @@ class FormatDialog(tk.Toplevel):
     def _confirm(self):
         want_video = self._video_var.get()
         want_audio = self._audio_var.get()
+        subtitle_langs = [lang for lang, var in self._sub_vars.items() if var.get()]
+        subtitle_only = (not want_video and not want_audio and bool(subtitle_langs))
 
-        if not want_video and not want_audio:
-            messagebox.showwarning("请选择", "请至少勾选「视频」或「音频」之一", parent=self)
+        if not want_video and not want_audio and not subtitle_langs:
+            messagebox.showwarning("请选择", "请至少勾选「视频」、「音频」或「字幕」之一", parent=self)
             return
 
         height_val = self._height_var.get()
-        subtitle_langs = [lang for lang, var in self._sub_vars.items() if var.get()]
 
-        if not want_video:
+        if subtitle_only:
+            fmt = "bestaudio/best"   # skip_download=True 时格式无意义，填占位
+            audio_only = False
+            also_audio = False
+        elif not want_video:
             fmt = "bestaudio/best"
             audio_only = True
             also_audio = False
@@ -380,6 +385,7 @@ class FormatDialog(tk.Toplevel):
             'subtitle_langs': subtitle_langs,
             'audio_only': audio_only,
             'also_audio': also_audio,
+            'subtitle_only': subtitle_only,
         }
         self.destroy()
         self._on_confirm(result)
@@ -571,8 +577,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
 
-        nb = ttk.Notebook(self)
+        self._nb = ttk.Notebook(self)
+        nb = self._nb
         nb.grid(row=0, column=0, sticky="nsew")
+        nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         tab_t = tk.Frame(nb, bg="#1e1e1e")
         tab_d = tk.Frame(nb, bg="#1e1e1e")
@@ -812,10 +820,10 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._lbl(p, "视频链接（支持 YouTube、X/Twitter、B站等）").grid(
             row=3, column=0, sticky="w", padx=16, pady=(10, 0))
         self.dl_url_var = tk.StringVar()
-        tk.Entry(p, textvariable=self.dl_url_var, bg="#2d2d2d", fg="#ffffff",
-                 insertbackground="white", relief="flat",
-                 font=("Segoe UI", 10), bd=4).grid(
-            row=4, column=0, sticky="ew", padx=16, pady=(2, 0), ipady=4)
+        self._dl_url_entry = tk.Entry(p, textvariable=self.dl_url_var, bg="#2d2d2d", fg="#ffffff",
+                                      insertbackground="white", relief="flat",
+                                      font=("Segoe UI", 10), bd=4)
+        self._dl_url_entry.grid(row=4, column=0, sticky="ew", padx=16, pady=(2, 0), ipady=4)
 
         f_btn = tk.Frame(p, bg="#1e1e1e")
         f_btn.grid(row=5, column=0, pady=14)
@@ -1182,6 +1190,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
 
     # ── Download tab events ───────────────────────────────────────────────────
 
+    def _on_tab_changed(self, event):
+        idx = self._nb.index("current")
+        if idx == 1:   # 下载 tab
+            self.after(50, self._dl_url_entry.focus_set)
+
     def _browse_dl_dir(self):
         path = filedialog.askdirectory(title="选择视频保存目录")
         if path:
@@ -1263,14 +1276,17 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         _safe = re.sub(r'[\\/:*?"<>|]', '_', title).strip()[:40]
         self._last_dl_dir = os.path.normpath(os.path.join(save_dir, _safe))
 
-        parts = []
-        if fmt_opts.get('audio_only'):
-            parts.append("音频(MP3)")
+        if fmt_opts.get('subtitle_only'):
+            content_desc = "仅字幕"
         else:
-            parts.append("视频(MP4)")
-            if fmt_opts.get('also_audio'):
-                parts.append("+ 音频(MP3)")
-        content_desc = " ".join(parts)
+            parts = []
+            if fmt_opts.get('audio_only'):
+                parts.append("音频(MP3)")
+            else:
+                parts.append("视频(MP4)")
+                if fmt_opts.get('also_audio'):
+                    parts.append("+ 音频(MP3)")
+            content_desc = " ".join(parts)
         sub_desc = ", ".join(fmt_opts['subtitle_langs']) if fmt_opts['subtitle_langs'] else "无字幕"
         self._dl_log(f"▶ 开始下载  [{content_desc}]  字幕: {sub_desc}")
 
@@ -1282,6 +1298,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             'subtitle_langs': fmt_opts['subtitle_langs'],
             'audio_only': fmt_opts['audio_only'],
             'also_audio': fmt_opts.get('also_audio', False),
+            'subtitle_only': fmt_opts.get('subtitle_only', False),
         }
 
         def task():

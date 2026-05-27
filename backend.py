@@ -789,6 +789,39 @@ def query_video_info(url):
     }, None
 
 
+# ── Download helpers ──────────────────────────────────────────────────────────
+
+def _ffmpeg_convert_vtt(vtt_path, log):
+    """用 FFmpeg 将单个 .vtt 转成 .srt，成功后删除原文件。返回是否成功。"""
+    import shutil
+    import subprocess
+
+    ffmpeg = shutil.which('ffmpeg')
+    if not ffmpeg:
+        log("⚠️ 未找到 ffmpeg，无法将 VTT 转为 SRT")
+        return False
+
+    srt_path = os.path.splitext(vtt_path)[0] + '.srt'
+    try:
+        result = subprocess.run(
+            [ffmpeg, '-y', '-i', vtt_path, srt_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and os.path.exists(srt_path):
+            os.remove(vtt_path)
+            return True
+        # FFmpeg 失败时把 stderr 末尾 200 字符记录到日志
+        stderr_tail = result.stderr.strip()[-200:] if result.stderr else ''
+        log(f"⚠️ VTT→SRT 转换失败: {stderr_tail}")
+        return False
+    except subprocess.TimeoutExpired:
+        log("⚠️ VTT→SRT 转换超时")
+        return False
+    except Exception as e:
+        log(f"⚠️ VTT→SRT 转换异常: {e}")
+        return False
+
+
 # ── Download ──────────────────────────────────────────────────────────────────
 
 def run_download(config, log):
@@ -805,6 +838,7 @@ def run_download(config, log):
     subtitle_langs = config.get('subtitle_langs', [])
     audio_only = config.get('audio_only', False)
     also_audio = config.get('also_audio', False)
+    subtitle_only = config.get('subtitle_only', False)
 
     try:
         os.makedirs(save_dir, exist_ok=True)
@@ -862,29 +896,45 @@ def run_download(config, log):
     postprocessors = []
     if subtitle_langs:
         postprocessors.append({'key': 'FFmpegSubtitlesConvertor', 'format': 'srt'})
-    if audio_only or also_audio:
+    if not subtitle_only and (audio_only or also_audio):
         postprocessors.append({'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'})
 
-    ydl_opts = {
-        'format': format_str,
-        'outtmpl': os.path.join(video_dir, '%(title)s.%(ext)s'),
-        'writesubtitles': bool(subtitle_langs),
-        'writeautomaticsub': bool(subtitle_langs),
-        'subtitleslangs': subtitle_langs if subtitle_langs else [],
-        'merge_output_format': 'mp4' if not audio_only else None,
-        'keepvideo': also_audio,
-        'postprocessors': postprocessors,
-        'progress_hooks': [progress_hook],
-        'logger': YDLLogger(),
-        'no_warnings': True,
-        'ignoreerrors': True,
-        'sleep_interval_subtitles': 2,
-        'retries': 5,
-    }
+    if subtitle_only:
+        ydl_opts = {
+            'outtmpl': os.path.join(video_dir, '%(title)s.%(ext)s'),
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+            'subtitleslangs': subtitle_langs,
+            'skip_download': True,
+            'postprocessors': postprocessors,
+            'progress_hooks': [progress_hook],
+            'logger': YDLLogger(),
+            'no_warnings': True,
+            'ignoreerrors': True,
+            'sleep_interval_subtitles': 2,
+            'retries': 5,
+        }
+        log("📄 仅下载字幕（跳过视频）...")
+    else:
+        ydl_opts = {
+            'format': format_str,
+            'outtmpl': os.path.join(video_dir, '%(title)s.%(ext)s'),
+            'writesubtitles': bool(subtitle_langs),
+            'writeautomaticsub': bool(subtitle_langs),
+            'subtitleslangs': subtitle_langs if subtitle_langs else [],
+            'merge_output_format': 'mp4' if not audio_only else None,
+            'keepvideo': also_audio,
+            'postprocessors': postprocessors,
+            'progress_hooks': [progress_hook],
+            'logger': YDLLogger(),
+            'no_warnings': True,
+            'ignoreerrors': True,
+            'sleep_interval_subtitles': 2,
+            'retries': 5,
+        }
+        log("⬇️ 开始下载...")
     if impersonate_target is not None:
         ydl_opts['impersonate'] = impersonate_target
-
-    log("⬇️ 开始下载...")
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -908,10 +958,27 @@ def run_download(config, log):
             return video_dir
 
     all_files = os.listdir(video_dir)
-    video_exts = ('.mp4', '.mkv', '.webm', '.mp3', '.m4a', '.opus')
-    media_files = [f for f in all_files if os.path.splitext(f)[1].lower() in video_exts]
-    if media_files:
-        log(f"🎉 全部完成！文件保存至: {video_dir}")
+    if subtitle_only:
+        # 将残留的 .vtt 转为 .srt（skip_download=True 时 postprocessor 不触发）
+        vtt_files = [f for f in all_files if os.path.splitext(f)[1].lower() == '.vtt']
+        for vtt_file in vtt_files:
+            vtt_path = os.path.join(video_dir, vtt_file)
+            log(f"🔄 转换字幕格式: {vtt_file} → SRT")
+            _ffmpeg_convert_vtt(vtt_path, log)
+
+        # 重新扫描（转换后文件列表已变化）
+        all_files = os.listdir(video_dir)
+        sub_exts = ('.srt', '.vtt', '.ass', '.ssa')
+        sub_files = [f for f in all_files if os.path.splitext(f)[1].lower() in sub_exts]
+        if sub_files:
+            log(f"🎉 字幕下载完成！共 {len(sub_files)} 个文件，保存至: {video_dir}")
+        else:
+            log("⚠️ 字幕文件未找到，该视频可能没有可用字幕，请检查日志")
     else:
-        log("⚠️ 媒体文件未找到，字幕或其他文件可能已下载，请检查日志")
+        video_exts = ('.mp4', '.mkv', '.webm', '.mp3', '.m4a', '.opus')
+        media_files = [f for f in all_files if os.path.splitext(f)[1].lower() in video_exts]
+        if media_files:
+            log(f"🎉 全部完成！文件保存至: {video_dir}")
+        else:
+            log("⚠️ 媒体文件未找到，字幕或其他文件可能已下载，请检查日志")
     return video_dir
