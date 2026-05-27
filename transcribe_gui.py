@@ -70,10 +70,9 @@ def _apply_dark_titlebar(window):
 class GeminiKeyListWidget(tk.Frame):
     """Masked list of Gemini API keys with add/delete buttons."""
 
-    def __init__(self, parent, threads_var, **kwargs):
+    def __init__(self, parent, **kwargs):
         super().__init__(parent, bg="#1e1e1e", **kwargs)
         self._keys = []
-        self._threads_var = threads_var
         self.columnconfigure(0, weight=1)
         self._build()
 
@@ -117,16 +116,6 @@ class GeminiKeyListWidget(tk.Frame):
             font=("Segoe UI", 9), cursor="hand2", activebackground="#4a4a4a",
         ).pack(side="left", padx=(8, 0))
 
-        # Threads row
-        f_threads = tk.Frame(self, bg="#1e1e1e")
-        f_threads.grid(row=2, column=0, sticky="w", pady=(6, 0))
-        tk.Label(f_threads, text="线程数", bg="#1e1e1e", fg="#888888",
-                 font=("Segoe UI", 9)).pack(side="left")
-        tk.Entry(
-            f_threads, textvariable=self._threads_var, width=5,
-            bg="#2d2d2d", fg="#ffffff", insertbackground="white",
-            relief="flat", font=("Segoe UI", 10), bd=4,
-        ).pack(side="left", padx=(8, 0), ipady=3)
 
     def _add_key(self):
         dlg = tk.Toplevel(self)
@@ -519,7 +508,7 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                              if provider == "gemini"
                              else self._saved_config.get("gemini_model", DEFAULT_MODELS_GEMINI[0])),
             "gemini_custom_models": gemini_custom,
-            "gemini_threads": self.gemini_threads_var.get().strip(),
+            "translate_threads": self.threads_var.get().strip(),
             "output_mode": self.output_mode_var.get(),
             "batch_size": self.batch_var.get().strip(),
             "download_dir": self.dl_dir_var.get().strip(),
@@ -730,10 +719,9 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
         self._ark_key_entry.grid(row=2, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
 
         # Gemini key widget
-        self._gemini_key_lbl = self._lbl(tof, "Google Gemini API Key（每个 Key 一行，多 Key 自动轮询）")
+        self._gemini_key_lbl = self._lbl(tof, "Google Gemini API Key（多 Key 自动轮询）")
         self._gemini_key_lbl.grid(row=1, column=0, sticky="w", padx=16, pady=(6, 0))
-        self.gemini_threads_var = tk.StringVar(value=cfg.get("gemini_threads", "1"))
-        self._gemini_key_widget = GeminiKeyListWidget(tof, self.gemini_threads_var)
+        self._gemini_key_widget = GeminiKeyListWidget(tof)
         self._gemini_key_widget.grid(row=2, column=0, sticky="ew", padx=16, pady=(2, 4))
         self._gemini_key_widget.set_keys(cfg.get("gemini_api_keys", []))
 
@@ -752,6 +740,12 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
                  font=("Segoe UI", 9)).pack(side="left")
         self.batch_var = tk.StringVar(value=cfg.get("batch_size", "15"))
         tk.Entry(f_batch, textvariable=self.batch_var, width=6, bg="#2d2d2d", fg="#ffffff",
+                 insertbackground="white", relief="flat", font=("Segoe UI", 10),
+                 bd=4).pack(side="left", padx=(8, 0), ipady=3)
+        tk.Label(f_batch, text="并发数", bg="#1e1e1e", fg="#888888",
+                 font=("Segoe UI", 9)).pack(side="left", padx=(18, 0))
+        self.threads_var = tk.StringVar(value=cfg.get("translate_threads", "3"))
+        tk.Entry(f_batch, textvariable=self.threads_var, width=4, bg="#2d2d2d", fg="#ffffff",
                  insertbackground="white", relief="flat", font=("Segoe UI", 10),
                  bd=4).pack(side="left", padx=(8, 0), ipady=3)
 
@@ -1137,11 +1131,11 @@ class App(TkinterDnD.Tk if HAS_DND else tk.Tk):
             "api_key": self.sf_key_var.get().strip(),
             "ark_api_key": self.ark_key_var.get().strip(),
             "gemini_api_keys": self._gemini_key_widget.get_keys(),
-            "gemini_threads": self.gemini_threads_var.get().strip(),
             "translate_model": self.trans_model_var.get().strip() if provider == "siliconflow" else "",
             "ark_model": self.trans_model_var.get().strip() if provider == "volcengine" else "",
             "gemini_model": self.trans_model_var.get().strip() if provider == "gemini" else "",
             "batch_size": batch_size,
+            "translate_threads": self.threads_var.get().strip(),
         }
 
         self._do_save_config()

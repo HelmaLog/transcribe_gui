@@ -78,6 +78,7 @@ DEFAULT_CONFIG = {
     "gemini_custom_models": [],
     "gemini_threads": "1",
     "output_mode": "bilingual",
+    "translate_threads": "3",
     "batch_size": "15",
     "download_dir": "",
     "tweet_provider": "gemini",
@@ -108,6 +109,9 @@ def load_config():
                 # Backward compat: max_chars → max_chars_en
                 if "max_chars" in cfg and "max_chars_en" not in cfg:
                     cfg["max_chars_en"] = cfg["max_chars"]
+                # Backward compat: gemini_threads → translate_threads
+                if "gemini_threads" in cfg and "translate_threads" not in cfg:
+                    cfg["translate_threads"] = cfg["gemini_threads"]
                 # Ensure tweet_prompts has exactly 3 items
                 prompts = cfg.get("tweet_prompts", [])
                 while len(prompts) < 3:
@@ -645,7 +649,7 @@ def run_transcribe(config, log, stop_event=None):
                 }.get(provider, "Google Gemini")
                 mode_name = "中文" if output_mode == "chinese_only" else "双语"
 
-                concurrency = max(1, int(config.get("gemini_threads", 1))) if provider == "gemini" else 3
+                concurrency = max(1, int(config.get("translate_threads", 3)))
                 log(f"开始翻译（{mode_name}），{provider_name} / {translate_model}，"
                     f"每批 {batch_size} 行，共 {len(batches)} 批，{concurrency} 路并发...")
                 translations = {}
