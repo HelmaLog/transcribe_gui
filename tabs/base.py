@@ -31,7 +31,7 @@ class Tab:
         f = tk.Frame(parent, bg=BG)
         f.grid(row=row*2+1, column=0, columnspan=3, sticky="ew", padx=16, pady=(2, 0))
         f.columnconfigure(0, weight=1)
-        entry = tk.Entry(f, textvariable=var, bg="#2d2d2d", fg="#ffffff",
+        entry = tk.Entry(f, textvariable=var, bg="#252525", fg="#aaaaaa",
                          insertbackground="white", relief="flat",
                          font=("Segoe UI", 10), bd=4)
         entry.grid(row=0, column=0, sticky="ew", ipady=4)

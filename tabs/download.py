@@ -85,11 +85,11 @@ class FormatDialog(tk.Toplevel):
         self._video_var = tk.BooleanVar(value=True)
         self._audio_var = tk.BooleanVar(value=False)
         tk.Checkbutton(f_type, text="视频（MP4）", variable=self._video_var,
-                       bg=BG, fg="#cccccc", selectcolor="#2d2d2d",
+                       bg=BG, fg="#cccccc", selectcolor="#252525",
                        activebackground=BG, font=("Segoe UI", 10),
                        command=self._on_content_change).pack(side="left", padx=(0, 24))
         tk.Checkbutton(f_type, text="音频（MP3）", variable=self._audio_var,
-                       bg=BG, fg="#cccccc", selectcolor="#2d2d2d",
+                       bg=BG, fg="#cccccc", selectcolor="#252525",
                        activebackground=BG, font=("Segoe UI", 10)
                        ).pack(side="left")
 
@@ -106,7 +106,7 @@ class FormatDialog(tk.Toplevel):
         self._height_radios = []
         for val, lbl in choices:
             rb = tk.Radiobutton(self._height_frame, text=lbl, variable=self._height_var, value=val,
-                                bg=BG, fg="#cccccc", selectcolor="#2d2d2d",
+                                bg=BG, fg="#cccccc", selectcolor="#252525",
                                 activebackground=BG, font=("Segoe UI", 10))
             rb.pack(side="left", padx=(0, 12))
             self._height_radios.append(rb)
@@ -121,7 +121,7 @@ class FormatDialog(tk.Toplevel):
         f_sub_header.grid(row=11, column=0, columnspan=2, sticky="w", padx=24, pady=(0, 2))
         self._sub_all_var = tk.BooleanVar(value=False)
         tk.Checkbutton(f_sub_header, text="全选", variable=self._sub_all_var,
-                       bg=BG, fg="#aaaaaa", selectcolor="#2d2d2d",
+                       bg=BG, fg="#aaaaaa", selectcolor="#252525",
                        activebackground=BG, font=("Segoe UI", 9),
                        command=self._toggle_all_subs).pack(side="left")
 
@@ -152,7 +152,7 @@ class FormatDialog(tk.Toplevel):
             row_f.grid(row=i // cols, column=i % cols, sticky="w", padx=(0, 20), pady=1)
             cb = tk.Checkbutton(row_f, text=f"{meta['name']} ({lang})",
                                 variable=var, bg=BG, fg="#cccccc",
-                                selectcolor="#2d2d2d", activebackground=BG,
+                                selectcolor="#252525", activebackground=BG,
                                 font=("Segoe UI", 9))
             cb.pack(side="left")
             tk.Label(row_f, text=type_tag, bg=BG, fg=type_color,
@@ -167,9 +167,9 @@ class FormatDialog(tk.Toplevel):
                   font=("Segoe UI", 10), cursor="hand2",
                   activebackground="#4a4a4a").pack(side="left", padx=(0, 12))
         tk.Button(f_btn, text="⬇  确认下载", command=self._confirm,
-                  bg="#0078d4", fg="#ffffff", relief="flat", padx=20, pady=7,
+                  bg="#1e4a1e", fg="#aaddaa", relief="flat", padx=20, pady=7,
                   font=("Segoe UI", 10, "bold"), cursor="hand2",
-                  activebackground="#005fa3").pack(side="left")
+                  activebackground="#2a6a2a").pack(side="left")
 
         self._on_content_change()
 
@@ -250,7 +250,7 @@ class DownloadTab(Tab):
         f_dir.grid(row=2, column=0, sticky="ew", padx=16, pady=(2, 0))
         f_dir.columnconfigure(0, weight=1)
         self.dl_dir_var = tk.StringVar(value=cfg.get("download_dir", ""))
-        tk.Entry(f_dir, textvariable=self.dl_dir_var, bg="#2d2d2d", fg="#ffffff",
+        tk.Entry(f_dir, textvariable=self.dl_dir_var, bg="#252525", fg="#aaaaaa",
                  insertbackground="white", relief="flat",
                  font=("Segoe UI", 10), bd=4).grid(row=0, column=0, sticky="ew", ipady=4)
         tk.Button(f_dir, text="浏览", command=self._browse_dl_dir,
@@ -261,7 +261,7 @@ class DownloadTab(Tab):
         self._lbl(p, "视频链接（支持 YouTube、X/Twitter、B站等）").grid(
             row=3, column=0, sticky="w", padx=16, pady=(10, 0))
         self.dl_url_var = tk.StringVar()
-        self._dl_url_entry = tk.Entry(p, textvariable=self.dl_url_var, bg="#2d2d2d", fg="#ffffff",
+        self._dl_url_entry = tk.Entry(p, textvariable=self.dl_url_var, bg="#252525", fg="#aaaaaa",
                                       insertbackground="white", relief="flat",
                                       font=("Segoe UI", 10), bd=4)
         self._dl_url_entry.grid(row=4, column=0, sticky="ew", padx=16, pady=(2, 0), ipady=4)
@@ -270,9 +270,9 @@ class DownloadTab(Tab):
         f_btn.grid(row=5, column=0, pady=14)
         self.dl_btn = tk.Button(
             f_btn, text="🔍  查询并选择格式", command=self._start_download,
-            bg="#0078d4", fg="#ffffff", relief="flat",
+            bg="#1e4a1e", fg="#aaddaa", relief="flat",
             font=("Segoe UI", 10, "bold"), padx=20, pady=7,
-            cursor="hand2", activebackground="#005fa3")
+            cursor="hand2", activebackground="#2a6a2a")
         self.dl_btn.pack(side="left")
         tk.Button(
             f_btn, text="📁 打开文件夹", command=self._open_dl_folder,
@@ -298,7 +298,7 @@ class DownloadTab(Tab):
 
         p.rowconfigure(8, weight=1)
         self.dl_log_box = scrolledtext.ScrolledText(
-            p, bg="#111111", fg="#cccccc", font=("Consolas", 9),
+            p, bg="#141414", fg="#cccccc", font=("Consolas", 9),
             relief="flat", state="disabled", height=10)
         self.dl_log_box.grid(row=8, column=0, sticky="nsew", padx=16, pady=(0, 16))
 

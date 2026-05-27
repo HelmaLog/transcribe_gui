@@ -59,7 +59,7 @@ class TweetTab(Tab):
                                                 padx=(14, 6), pady=(10, 6))
             name_var = tk.StringVar(value=pd["name"])
             self._tweet_prompt_name_vars.append(name_var)
-            tk.Entry(tab, textvariable=name_var, bg="#2d2d2d", fg="#cccccc",
+            tk.Entry(tab, textvariable=name_var, bg="#252525", fg="#cccccc",
                      insertbackground="#aaaaaa", relief="flat",
                      font=("Segoe UI", 10), bd=3, highlightthickness=0).grid(
                 row=0, column=1, sticky="ew", padx=(0, 14), pady=(10, 6), ipady=4)

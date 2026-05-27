@@ -45,7 +45,7 @@ class GeminiKeyListWidget(tk.Frame):
         f_list.columnconfigure(0, weight=1)
 
         self._listbox = tk.Listbox(
-            f_list, bg="#2d2d2d", fg="#aaaaaa",
+            f_list, bg="#252525", fg="#aaaaaa",
             selectbackground="#0078d4", selectforeground="#ffffff",
             relief="flat", font=("Consolas", 9), height=3,
             activestyle="none", bd=4,
@@ -53,7 +53,7 @@ class GeminiKeyListWidget(tk.Frame):
         self._listbox.grid(row=0, column=0, sticky="ew", ipady=2)
 
         sb = tk.Scrollbar(f_list, orient="vertical", command=self._listbox.yview,
-                          bg="#2d2d2d", troughcolor=BG, width=10)
+                          bg="#3a3a3a", troughcolor=BG, width=10)
         sb.grid(row=0, column=1, sticky="ns")
         self._listbox.configure(yscrollcommand=sb.set)
 
@@ -85,7 +85,7 @@ class GeminiKeyListWidget(tk.Frame):
         key_var = tk.StringVar()
         e = tk.Entry(
             dlg, textvariable=key_var, show="•",
-            bg="#2d2d2d", fg="#ffffff", insertbackground="white",
+            bg="#252525", fg="#aaaaaa", insertbackground="white",
             relief="flat", font=("Segoe UI", 10), bd=4, width=42,
         )
         e.pack(padx=24, pady=(0, 4), ipady=5)
@@ -107,9 +107,9 @@ class GeminiKeyListWidget(tk.Frame):
                   font=("Segoe UI", 9), cursor="hand2",
                   activebackground="#4a4a4a").pack(side="left", padx=(0, 10))
         tk.Button(f_btn, text="添加", command=confirm,
-                  bg="#0078d4", fg="#ffffff", relief="flat", padx=18, pady=6,
+                  bg="#1e4a1e", fg="#aaddaa", relief="flat", padx=18, pady=6,
                   font=("Segoe UI", 9, "bold"), cursor="hand2",
-                  activebackground="#005fa3").pack(side="left")
+                  activebackground="#2a6a2a").pack(side="left")
 
         # Center over parent
         dlg.update_idletasks()
@@ -194,7 +194,7 @@ class TranscribeTab(Tab):
                          state="readonly").pack(side="left", padx=(4, 14))
 
         def oentry(var, w):
-            tk.Entry(f_opts, textvariable=var, width=w, bg="#2d2d2d", fg="#ffffff",
+            tk.Entry(f_opts, textvariable=var, width=w, bg="#252525", fg="#aaaaaa",
                      insertbackground="white", relief="flat", font=("Segoe UI", 10),
                      bd=4).pack(side="left", padx=(4, 14), ipady=3)
 
@@ -216,7 +216,7 @@ class TranscribeTab(Tab):
 
         self._lbl(p, "初始提示词（可选）").grid(row=10, column=0, sticky="w", padx=16, pady=(2, 0))
         self.prompt_var = tk.StringVar(value=cfg["initial_prompt"])
-        tk.Entry(p, textvariable=self.prompt_var, bg="#2d2d2d", fg="#ffffff",
+        tk.Entry(p, textvariable=self.prompt_var, bg="#252525", fg="#aaaaaa",
                  insertbackground="white", relief="flat", font=("Segoe UI", 10), bd=4
                  ).grid(row=11, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
 
@@ -234,7 +234,7 @@ class TranscribeTab(Tab):
         ]):
             tk.Radiobutton(
                 f_trans_title, text=txt, variable=self.output_mode_var, value=val,
-                bg=BG, fg="#aaaaaa", selectcolor="#2d2d2d",
+                bg=BG, fg="#aaaaaa", selectcolor="#252525",
                 activebackground=BG, font=("Segoe UI", 9),
                 command=self._on_output_mode_change,
             ).pack(side="left", padx=(16 if i == 0 else 6, 0))
@@ -252,7 +252,7 @@ class TranscribeTab(Tab):
         self.provider_var = tk.StringVar(value=cfg.get("provider", "siliconflow"))
         for val, txt in [("siliconflow", "硅基流动"), ("volcengine", "火山引擎 ARK"), ("gemini", "Google Gemini")]:
             tk.Radiobutton(f_provider, text=txt, variable=self.provider_var, value=val,
-                           bg=BG, fg="#aaaaaa", selectcolor="#2d2d2d",
+                           bg=BG, fg="#aaaaaa", selectcolor="#252525",
                            activebackground=BG, font=("Segoe UI", 9),
                            command=self._on_provider_change
                            ).pack(side="left", padx=(12, 0))
@@ -261,7 +261,7 @@ class TranscribeTab(Tab):
         self._sf_key_lbl = self._lbl(tof, "硅基流动 API Key")
         self._sf_key_lbl.grid(row=1, column=0, sticky="w", padx=16, pady=(6, 0))
         self.sf_key_var = tk.StringVar(value=cfg.get("api_key", ""))
-        self._sf_key_entry = tk.Entry(tof, textvariable=self.sf_key_var, bg="#2d2d2d", fg="#ffffff",
+        self._sf_key_entry = tk.Entry(tof, textvariable=self.sf_key_var, bg="#252525", fg="#aaaaaa",
                                       insertbackground="white", relief="flat",
                                       font=("Segoe UI", 10), bd=4, show="•")
         self._sf_key_entry.grid(row=2, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
@@ -270,7 +270,7 @@ class TranscribeTab(Tab):
         self._ark_key_lbl = self._lbl(tof, "火山引擎 ARK API Key")
         self._ark_key_lbl.grid(row=1, column=0, sticky="w", padx=16, pady=(6, 0))
         self.ark_key_var = tk.StringVar(value=cfg.get("ark_api_key", ""))
-        self._ark_key_entry = tk.Entry(tof, textvariable=self.ark_key_var, bg="#2d2d2d", fg="#ffffff",
+        self._ark_key_entry = tk.Entry(tof, textvariable=self.ark_key_var, bg="#252525", fg="#aaaaaa",
                                        insertbackground="white", relief="flat",
                                        font=("Segoe UI", 10), bd=4, show="•")
         self._ark_key_entry.grid(row=2, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
@@ -296,18 +296,18 @@ class TranscribeTab(Tab):
         tk.Label(f_batch, text="每批翻译行数", bg=BG, fg="#888888",
                  font=("Segoe UI", 9)).pack(side="left")
         self.batch_var = tk.StringVar(value=cfg.get("batch_size", "15"))
-        tk.Entry(f_batch, textvariable=self.batch_var, width=6, bg="#2d2d2d", fg="#ffffff",
+        tk.Entry(f_batch, textvariable=self.batch_var, width=6, bg="#252525", fg="#aaaaaa",
                  insertbackground="white", relief="flat", font=("Segoe UI", 10),
                  bd=4).pack(side="left", padx=(8, 0), ipady=3)
         tk.Label(f_batch, text="并发数", bg=BG, fg="#888888",
                  font=("Segoe UI", 9)).pack(side="left", padx=(18, 0))
         self.threads_var = tk.StringVar(value=cfg.get("translate_threads", "3"))
-        tk.Entry(f_batch, textvariable=self.threads_var, width=4, bg="#2d2d2d", fg="#ffffff",
+        tk.Entry(f_batch, textvariable=self.threads_var, width=4, bg="#252525", fg="#aaaaaa",
                  insertbackground="white", relief="flat", font=("Segoe UI", 10),
                  bd=4).pack(side="left", padx=(8, 0), ipady=3)
         self.emoji_var = tk.BooleanVar(value=cfg.get("add_emoji", True))
         tk.Checkbutton(f_batch, text="添加表情", variable=self.emoji_var,
-                       bg=BG, fg="#888888", selectcolor="#2d2d2d",
+                       bg=BG, fg="#888888", selectcolor="#252525",
                        activebackground=BG, font=("Segoe UI", 9),
                        ).pack(side="left", padx=(18, 0))
 
@@ -315,14 +315,14 @@ class TranscribeTab(Tab):
         f_btn_row = tk.Frame(p, bg=BG)
         f_btn_row.grid(row=15, column=0, pady=10)
         self.btn = tk.Button(f_btn_row, text="▶  开始", command=self._start,
-                             bg="#0078d4", fg="#ffffff", relief="flat",
+                             bg="#1e4a1e", fg="#aaddaa", relief="flat",
                              font=("Segoe UI", 11, "bold"), padx=24, pady=8,
-                             cursor="hand2", activebackground="#005fa3")
+                             cursor="hand2", activebackground="#2a6a2a")
         self.btn.pack(side="left")
         self.stop_btn = tk.Button(f_btn_row, text="⏹  停止", command=self._stop,
-                                  bg="#555555", fg="#aaaaaa", relief="flat",
+                                  bg="#3a3a3a", fg="#888888", relief="flat",
                                   font=("Segoe UI", 11, "bold"), padx=24, pady=8,
-                                  cursor="hand2", activebackground="#666666", state="disabled")
+                                  cursor="hand2", activebackground="#4a4a4a", state="disabled")
         self.stop_btn.pack(side="left", padx=(10, 0))
         self._open_folder_btn = tk.Button(
             f_btn_row, text="📂  打开目录", command=self._open_output_folder,
@@ -332,7 +332,7 @@ class TranscribeTab(Tab):
         self._open_folder_btn.pack(side="left", padx=(10, 0))
 
         p.rowconfigure(16, weight=1)
-        self.log_box = scrolledtext.ScrolledText(p, bg="#111111", fg="#cccccc",
+        self.log_box = scrolledtext.ScrolledText(p, bg="#141414", fg="#cccccc",
                                                  font=("Consolas", 9), relief="flat",
                                                  state="disabled", height=10)
         self.log_box.grid(row=16, column=0, sticky="nsew", padx=16, pady=(0, 16))
