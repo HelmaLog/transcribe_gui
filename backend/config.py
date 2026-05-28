@@ -79,6 +79,10 @@ DEFAULT_CONFIG = {
         {"name": "场景 3", "text": ""},
     ],
     "tweet_font_size": 11,
+    "tweet_line_spacing": 4,
+    "tweet_username": "qinqincr",
+    "tweet_sessions": [],
+    "tweet_active_session": 0,
 }
 
 
@@ -102,11 +106,11 @@ def load_config():
                 # Backward compat: gemini_threads → translate_threads
                 if "gemini_threads" in cfg and "translate_threads" not in cfg:
                     cfg["translate_threads"] = cfg["gemini_threads"]
-                # Ensure tweet_prompts has exactly 3 items
+                # Ensure at least one prompt
                 prompts = cfg.get("tweet_prompts", [])
-                while len(prompts) < 3:
-                    prompts.append({"name": f"场景 {len(prompts)+1}", "text": ""})
-                cfg["tweet_prompts"] = prompts[:3]
+                if not prompts:
+                    prompts = [{"name": "场景 1", "text": ""}]
+                cfg["tweet_prompts"] = prompts
                 return cfg
         except Exception:
             pass

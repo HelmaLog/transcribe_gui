@@ -23,9 +23,11 @@ def detect_hw_encoder():
     for enc, desc in candidates:
         try:
             result = subprocess.run(
-                [ffmpeg, '-f', 'lavfi', '-i', 'nullsrc=s=32x32:d=0.1',
+                [ffmpeg, '-f', 'lavfi', '-i', 'nullsrc=s=128x128:d=0.1',
+                 '-vf', 'format=yuv420p',
                  '-c:v', enc, '-frames:v', '1', '-f', 'null', '-'],
                 capture_output=True, timeout=8,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             if result.returncode == 0:
                 return enc, f'硬件加速 ({desc})'
@@ -55,6 +57,7 @@ def compress_probe(path):
              '-show_streams', '-show_format', path],
             capture_output=True, text=True, timeout=20,
             encoding='utf-8', errors='replace',
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         if result.returncode != 0:
             return None, f"ffprobe 错误: {result.stderr[:300]}"
@@ -171,6 +174,7 @@ def compress_video(config, log, progress_cb, stop_event=None):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True, encoding='utf-8', errors='replace',
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
 
         for line in proc.stderr:

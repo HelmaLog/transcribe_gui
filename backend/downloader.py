@@ -71,6 +71,7 @@ def _ffmpeg_convert_vtt(vtt_path, log):
         result = subprocess.run(
             [ffmpeg, '-y', '-i', vtt_path, srt_path],
             capture_output=True, text=True, timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         if result.returncode == 0 and os.path.exists(srt_path):
             os.remove(vtt_path)

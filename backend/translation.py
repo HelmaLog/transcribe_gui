@@ -2,6 +2,7 @@
 Translation functions: SiliconFlow, VolcEngine ARK, Google Gemini, and streaming chat.
 """
 
+import base64
 import json
 import re
 import time
@@ -234,6 +235,89 @@ def fetch_pioneer_models(api_key):
         return None
 
 
+def fetch_sf_models(api_key):
+    """Fetch SiliconFlow model list via GET /v1/models. Returns None on error."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "https://api.siliconflow.cn/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            method="GET"
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return [m["id"] for m in data.get("data", []) if m.get("id")] or None
+    except Exception:
+        return None
+
+
+def fetch_ark_models(api_key):
+    """Fetch VolcEngine ARK model list via GET /api/v3/models. Returns None on error."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "https://ark.cn-beijing.volces.com/api/v3/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            method="GET"
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return [m["id"] for m in data.get("data", []) if m.get("id")] or None
+    except Exception:
+        return None
+
+
+def test_ark_model(api_key, model_id, timeout=8):
+    """Probe one ARK model with a 1-token request.
+    Returns True (reachable), False (404 — not found/no access), None (other error).
+    """
+    import urllib.request
+    import urllib.error
+    payload = json.dumps({
+        "model": model_id,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+        "stream": False,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {api_key}"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout):
+            return True
+    except urllib.error.HTTPError as e:
+        return e.code != 404
+    except Exception:
+        return None
+
+
+def fetch_gemini_models(api_key):
+    """Fetch Gemini model list, filtered to generateContent-capable models. Returns None on error."""
+    import urllib.request
+    try:
+        key = api_key[0] if isinstance(api_key, list) else api_key
+        if not key:
+            return None
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}&pageSize=100"
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        result = []
+        for m in data.get("models", []):
+            name = m.get("name", "")
+            if not name.startswith("models/"):
+                continue
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            result.append(name[len("models/"):])
+        return result or None
+    except Exception:
+        return None
+
+
 def translate_batch_pioneer(subs_batch, api_key, model, log, add_emoji=True):
     import urllib.request
 
@@ -274,7 +358,51 @@ def translate_batch_pioneer(subs_batch, api_key, model, log, add_emoji=True):
     return _parse_translation(content) if content else {}
 
 
-def chat_completion_stream(messages, system_prompt, provider, api_key, model, on_chunk):
+def _gemini_parts(text, attachments):
+    """Build Gemini parts list with text + optional image/text attachments."""
+    parts = [{"text": text}]
+    for att in attachments:
+        mt = att.get("mime_type", "")
+        if mt.startswith("image/"):
+            parts.append({"inlineData": {"mimeType": mt, "data": base64.b64encode(att["data"]).decode()}})
+        else:
+            try:
+                body = att["data"].decode("utf-8", errors="replace")
+            except Exception:
+                body = "(binary)"
+            parts[0]["text"] += f"\n\n[附件: {att['name']}]\n{body}"
+    return parts
+
+
+def _openai_content(text, attachments):
+    """Build OpenAI-compatible content (str or list) with attachments."""
+    has_img = any(a.get("mime_type", "").startswith("image/") for a in attachments)
+    if has_img:
+        content = [{"type": "text", "text": text}]
+        for att in attachments:
+            mt = att.get("mime_type", "")
+            if mt.startswith("image/"):
+                b64 = base64.b64encode(att["data"]).decode()
+                content.append({"type": "image_url", "image_url": {"url": f"data:{mt};base64,{b64}"}})
+            else:
+                try:
+                    body = att["data"].decode("utf-8", errors="replace")
+                except Exception:
+                    body = "(binary)"
+                content[0]["text"] += f"\n\n[附件: {att['name']}]\n{body}"
+        return content
+    else:
+        out = text
+        for att in attachments:
+            try:
+                body = att["data"].decode("utf-8", errors="replace")
+            except Exception:
+                body = "(binary)"
+            out += f"\n\n[附件: {att['name']}]\n{body}"
+        return out
+
+
+def chat_completion_stream(messages, system_prompt, provider, api_key, model, on_chunk, attachments=None):
     """
     Streaming chat. Calls on_chunk(text) for each text chunk received.
     messages: list of {"role": "user"|"assistant", "content": str}
@@ -291,13 +419,14 @@ def chat_completion_stream(messages, system_prompt, provider, api_key, model, on
         if not keys:
             return None, "未配置 Gemini API Key，请在「转写」标签页中添加"
 
-        contents = [
-            {
-                "role": "user" if m["role"] == "user" else "model",
-                "parts": [{"text": m["content"]}],
-            }
-            for m in messages
-        ]
+        contents = []
+        for i, m in enumerate(messages):
+            role = "user" if m["role"] == "user" else "model"
+            if i == len(messages) - 1 and m["role"] == "user" and attachments:
+                parts = _gemini_parts(m["content"], attachments)
+            else:
+                parts = [{"text": m["content"]}]
+            contents.append({"role": role, "parts": parts})
         payload_dict = {
             "contents": contents,
             "generationConfig": {"temperature": 0.7, "maxOutputTokens": 4096},
@@ -353,7 +482,11 @@ def chat_completion_stream(messages, system_prompt, provider, api_key, model, on
         msgs = []
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
-        msgs.extend(messages)
+        for i, m in enumerate(messages):
+            if i == len(messages) - 1 and m["role"] == "user" and attachments:
+                msgs.append({"role": "user", "content": _openai_content(m["content"], attachments)})
+            else:
+                msgs.append(m)
         payload = json.dumps({
             "model": model,
             "messages": msgs,
@@ -397,7 +530,11 @@ def chat_completion_stream(messages, system_prompt, provider, api_key, model, on
         msgs = []
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
-        msgs.extend(messages)
+        for i, m in enumerate(messages):
+            if i == len(messages) - 1 and m["role"] == "user" and attachments:
+                msgs.append({"role": "user", "content": _openai_content(m["content"], attachments)})
+            else:
+                msgs.append(m)
         payload = json.dumps({
             "model": model,
             "messages": msgs,

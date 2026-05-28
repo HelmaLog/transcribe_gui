@@ -7,6 +7,7 @@ import threading
 import queue
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from tkinterdnd2 import DND_FILES
@@ -16,9 +17,17 @@ except ImportError:
 
 from backend import (
     DEFAULT_MODELS_SF, DEFAULT_MODELS_ARK, DEFAULT_MODELS_GEMINI, DEFAULT_MODELS_PIONEER,
-    fetch_pioneer_models,
+    fetch_pioneer_models, fetch_sf_models, fetch_ark_models, fetch_gemini_models,
+    test_ark_model,
     run_transcribe,
 )
+
+
+def _strip_model_marker(name: str) -> str:
+    for suffix in (" ✓", " ✗"):
+        if name.endswith(suffix):
+            return name[:-2]
+    return name
 from .base import Tab, BG
 
 
@@ -300,11 +309,19 @@ class TranscribeTab(Tab):
         f_model_hdr = tk.Frame(tof, bg=BG)
         f_model_hdr.grid(row=3, column=0, sticky="ew", padx=16, pady=(2, 0))
         self._lbl(f_model_hdr, "翻译模型（可手动输入新模型后回车保存）").pack(side="left")
+        _fbtn_kw = dict(relief="flat", padx=10, pady=1, font=("Segoe UI", 9),
+                        cursor="hand2", bg="#3a3a3a", fg="#cccccc", activebackground="#4a4a4a")
+        self._sf_fetch_btn = tk.Button(
+            f_model_hdr, text="获取模型列表", command=self._fetch_sf_models_trans, **_fbtn_kw)
+        self._sf_fetch_btn.pack(side="left", padx=(10, 0))
+        self._ark_fetch_btn = tk.Button(
+            f_model_hdr, text="获取模型列表", command=self._fetch_ark_models_trans, **_fbtn_kw)
+        self._ark_fetch_btn.pack(side="left", padx=(10, 0))
+        self._gemini_fetch_btn = tk.Button(
+            f_model_hdr, text="获取模型列表", command=self._fetch_gemini_models_trans, **_fbtn_kw)
+        self._gemini_fetch_btn.pack(side="left", padx=(10, 0))
         self._pioneer_fetch_btn = tk.Button(
-            f_model_hdr, text="获取模型列表", command=self._fetch_pioneer_models,
-            bg="#3a3a3a", fg="#cccccc", relief="flat", padx=10, pady=1,
-            font=("Segoe UI", 9), cursor="hand2", activebackground="#4a4a4a",
-        )
+            f_model_hdr, text="获取模型列表", command=self._fetch_pioneer_models, **_fbtn_kw)
         self._pioneer_fetch_btn.pack(side="left", padx=(10, 0))
 
         self.trans_model_var = tk.StringVar()
@@ -397,27 +414,36 @@ class TranscribeTab(Tab):
         self._pioneer_key_lbl.grid_remove()
         self._pioneer_key_entry.grid_remove()
         self._pioneer_fetch_btn.pack_forget()
+        self._sf_fetch_btn.pack_forget()
+        self._ark_fetch_btn.pack_forget()
+        self._gemini_fetch_btn.pack_forget()
         if provider == "siliconflow":
             self._sf_key_lbl.grid()
             self._sf_key_entry.grid()
-            models = DEFAULT_MODELS_SF + cfg.get("custom_models", [])
-            saved_model = cfg.get("translate_model", DEFAULT_MODELS_SF[0])
+            self._sf_fetch_btn.pack(side="left", padx=(10, 0))
+            custom = cfg.get("custom_models", [])
+            models = custom if custom else DEFAULT_MODELS_SF
+            saved_model = cfg.get("translate_model", models[0] if models else "")
         elif provider == "volcengine":
             self._ark_key_lbl.grid()
             self._ark_key_entry.grid()
-            models = DEFAULT_MODELS_ARK + cfg.get("ark_custom_models", [])
-            saved_model = cfg.get("ark_model", DEFAULT_MODELS_ARK[0])
+            self._ark_fetch_btn.pack(side="left", padx=(10, 0))
+            custom = cfg.get("ark_custom_models", [])
+            models = custom if custom else DEFAULT_MODELS_ARK
+            saved_model = cfg.get("ark_model", models[0] if models else "")
         elif provider == "pioneer":
             self._pioneer_key_lbl.grid()
             self._pioneer_key_entry.grid()
             self._pioneer_fetch_btn.pack(side="left", padx=(10, 0))
             models = cfg.get("pioneer_custom_models", DEFAULT_MODELS_PIONEER)
             saved_model = cfg.get("pioneer_model", models[0] if models else "")
-        else:
+        else:  # gemini
             self._gemini_key_lbl.grid()
             self._gemini_key_widget.grid()
-            models = DEFAULT_MODELS_GEMINI + cfg.get("gemini_custom_models", [])
-            saved_model = cfg.get("gemini_model", DEFAULT_MODELS_GEMINI[0])
+            self._gemini_fetch_btn.pack(side="left", padx=(10, 0))
+            custom = cfg.get("gemini_custom_models", [])
+            models = custom if custom else DEFAULT_MODELS_GEMINI
+            saved_model = cfg.get("gemini_model", models[0] if models else "")
         self.trans_combo["values"] = models
         self.trans_model_var.set(saved_model if saved_model in models else (models[0] if models else ""))
 
@@ -457,6 +483,7 @@ class TranscribeTab(Tab):
             else:
                 def _update():
                     cfg = self.app._saved_config
+                    models = sorted(models)
                     cfg["pioneer_custom_models"] = models
                     if not cfg.get("pioneer_model") or cfg["pioneer_model"] not in models:
                         cfg["pioneer_model"] = models[0]
@@ -466,8 +493,122 @@ class TranscribeTab(Tab):
                     self._log(f"✅ 获取到 {len(models)} 个模型（已保存）")
                 self.app.after(0, _update)
 
-        import threading
         threading.Thread(target=_do_fetch, daemon=True).start()
+
+    def _fetch_sf_models_trans(self):
+        key = self.sf_key_var.get().strip()
+        if not key:
+            self._log("❌ 请先填写硅基流动 API Key")
+            return
+        self._log("正在获取硅基流动模型列表...")
+        self._sf_fetch_btn.configure(text="获取中...", state="disabled")
+
+        def _do():
+            models = fetch_sf_models(key)
+
+            def _update():
+                self._sf_fetch_btn.configure(text="获取模型列表", state="normal")
+                if models is None:
+                    self._log("❌ 获取失败，请检查 API Key 或网络")
+                elif not models:
+                    self._log("⚠️ 未找到可用模型")
+                else:
+                    cfg = self.app._saved_config
+                    models = sorted(models)
+                    cfg["custom_models"] = models
+                    if not cfg.get("translate_model") or cfg["translate_model"] not in models:
+                        cfg["translate_model"] = models[0]
+                    self.app._do_save_config()
+                    self._on_provider_change()
+                    self._log(f"✅ 获取到 {len(models)} 个模型（已保存）")
+
+            self.app.after(0, _update)
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _fetch_ark_models_trans(self):
+        key = self.ark_key_var.get().strip()
+        if not key:
+            self._log("❌ 请先填写火山引擎 ARK API Key")
+            return
+        self._log("正在获取 ARK 模型列表（含可用性检测，请稍候）...")
+        self._ark_fetch_btn.configure(text="获取中...", state="disabled")
+
+        def _do():
+            raw = fetch_ark_models(key)
+            if raw is None:
+                def _fail():
+                    self._ark_fetch_btn.configure(text="获取模型列表", state="normal")
+                    self._log("❌ 获取失败，请检查 API Key 或网络")
+                self.app.after(0, _fail)
+                return
+            if not raw:
+                def _empty():
+                    self._ark_fetch_btn.configure(text="获取模型列表", state="normal")
+                    self._log("⚠️ 未找到可用模型")
+                self.app.after(0, _empty)
+                return
+
+            results = {}
+            with ThreadPoolExecutor(max_workers=min(8, len(raw))) as pool:
+                futures = {pool.submit(test_ark_model, key, m): m for m in raw}
+                for f in as_completed(futures):
+                    m = futures[f]
+                    results[m] = f.result()
+
+            marked = []
+            for m in raw:
+                ok = results.get(m)
+                marked.append(f"{m} ✓" if ok is True else f"{m} ✗" if ok is False else m)
+            marked.sort(key=lambda n: (0 if n.endswith(" ✓") else 1, n))
+
+            def _update():
+                self._ark_fetch_btn.configure(text="获取模型列表", state="normal")
+                cfg = self.app._saved_config
+                cfg["ark_custom_models"] = marked
+                avail = sum(1 for n in marked if n.endswith(" ✓"))
+                saved = cfg.get("ark_model", "")
+                if not saved or saved not in marked:
+                    first_ok = next((n for n in marked if n.endswith(" ✓")), marked[0] if marked else "")
+                    cfg["ark_model"] = first_ok
+                self.app._do_save_config()
+                self._on_provider_change()
+                self._log(f"✅ 获取到 {len(marked)} 个模型（{avail} 个可用，已保存）")
+
+            self.app.after(0, _update)
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _fetch_gemini_models_trans(self):
+        keys = self._gemini_key_widget.get_keys()
+        if not keys:
+            self._log("❌ 请先添加 Gemini API Key")
+            return
+        self._log("正在获取 Gemini 模型列表...")
+        self._gemini_fetch_btn.configure(text="获取中...", state="disabled")
+
+        def _do():
+            models = fetch_gemini_models(keys)
+
+            def _update():
+                self._gemini_fetch_btn.configure(text="获取模型列表", state="normal")
+                if models is None:
+                    self._log("❌ 获取失败，请检查 API Key 或网络")
+                elif not models:
+                    self._log("⚠️ 未找到可用的 Gemini 模型")
+                else:
+                    cfg = self.app._saved_config
+                    models = sorted(models)
+                    cfg["gemini_custom_models"] = models
+                    if not cfg.get("gemini_model") or cfg["gemini_model"] not in models:
+                        cfg["gemini_model"] = models[0]
+                    self.app._do_save_config()
+                    self._on_provider_change()
+                    self._log(f"✅ 获取到 {len(models)} 个 Gemini 模型（已保存）")
+
+            self.app.after(0, _update)
+
+        threading.Thread(target=_do, daemon=True).start()
 
     # ── File browsing / DnD ───────────────────────────────────────────────────
 
@@ -559,7 +700,7 @@ class TranscribeTab(Tab):
             "gemini_api_keys": self._gemini_key_widget.get_keys(),
             "pioneer_api_key": self.pioneer_key_var.get().strip(),
             "translate_model": self.trans_model_var.get().strip() if provider == "siliconflow" else "",
-            "ark_model": self.trans_model_var.get().strip() if provider == "volcengine" else "",
+            "ark_model": _strip_model_marker(self.trans_model_var.get().strip()) if provider == "volcengine" else "",
             "gemini_model": self.trans_model_var.get().strip() if provider == "gemini" else "",
             "pioneer_model": self.trans_model_var.get().strip() if provider == "pioneer" else "",
             "batch_size": batch_size,
@@ -631,10 +772,11 @@ class TranscribeTab(Tab):
             gemini_model = cfg.get("gemini_model", DEFAULT_MODELS_GEMINI[0])
             pioneer_model = cfg.get("pioneer_model", "")
         elif provider == "volcengine":
-            if cur and cur not in DEFAULT_MODELS_ARK and cur not in ark_custom:
+            clean = _strip_model_marker(cur)
+            if clean and clean not in DEFAULT_MODELS_ARK and cur not in ark_custom:
                 ark_custom.append(cur)
             translate_model = cfg.get("translate_model", DEFAULT_MODELS_SF[0])
-            ark_model    = cur
+            ark_model    = clean
             gemini_model = cfg.get("gemini_model", DEFAULT_MODELS_GEMINI[0])
             pioneer_model = cfg.get("pioneer_model", "")
         elif provider == "pioneer":
