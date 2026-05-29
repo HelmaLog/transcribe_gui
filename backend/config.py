@@ -67,6 +67,7 @@ DEFAULT_CONFIG = {
     "pioneer_model": "",
     "pioneer_custom_models": [],
     "output_mode": "bilingual",
+    "snap_to_30fps": True,
     "add_emoji": True,
     "translate_threads": "3",
     "batch_size": "15",

@@ -5,6 +5,27 @@ Whisper transcription logic.
 import os
 from datetime import timedelta
 
+_FRAME_MS = 1000.0 / 30
+
+
+def _snap_ms(ms):
+    return round(round(ms / _FRAME_MS) * _FRAME_MS)
+
+
+def _snap_srt_to_30fps(subs):
+    """将字幕时间码对齐到 30fps 帧边界，解决 CapCut 渲染闪烁问题。"""
+    for sub in subs:
+        s = int(sub.start.total_seconds() * 1000)
+        e = int(sub.end.total_seconds() * 1000)
+        ns = _snap_ms(s)
+        ne = _snap_ms(e)
+        if ne <= ns:
+            ne = ns + round(_FRAME_MS)
+        sub.start = timedelta(milliseconds=ns)
+        sub.end = timedelta(milliseconds=ne)
+    return subs
+
+
 from .config import DEFAULT_MODELS_GEMINI
 from .translation import (
     translate_batch, translate_batch_ark, translate_batch_gemini, translate_batch_pioneer,
@@ -186,6 +207,10 @@ def run_transcribe(config, log, stop_event=None):
 
         base_path = os.path.join(save_dir, short_name)
 
+        snap = config.get("snap_to_30fps", False)
+        if snap:
+            _snap_srt_to_30fps(split_subs)
+
         # ── 保存英文字幕 ──
         # 从视频转写时始终保存；使用现有 SRT 且模式为"只生成英文"时也保存
         if not use_existing_srt or output_mode == "english_only":
@@ -274,6 +299,8 @@ def run_transcribe(config, log, stop_event=None):
                     prefix = "部分中文_" if stopped else "中文_"
                 else:
                     prefix = "部分双语_" if stopped else "双语_"
+                if snap:
+                    _snap_srt_to_30fps(output_subs)
                 out_path = os.path.join(save_dir, prefix + short_name + ".srt")
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(srt.compose(output_subs))

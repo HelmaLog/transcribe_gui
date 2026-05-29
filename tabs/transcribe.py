@@ -349,6 +349,11 @@ class TranscribeTab(Tab):
                        bg=BG, fg="#888888", selectcolor="#252525",
                        activebackground=BG, font=("Segoe UI", 9),
                        ).pack(side="left", padx=(18, 0))
+        self.snap_30fps_var = tk.BooleanVar(value=cfg.get("snap_to_30fps", True))
+        tk.Checkbutton(f_batch, text="30fps 对齐（CapCut）", variable=self.snap_30fps_var,
+                       bg=BG, fg="#888888", selectcolor="#252525",
+                       activebackground=BG, font=("Segoe UI", 9),
+                       ).pack(side="left", padx=(18, 0))
 
         # ── 按钮行 ──
         f_btn_row = tk.Frame(p, bg=BG)
@@ -706,6 +711,7 @@ class TranscribeTab(Tab):
             "batch_size": batch_size,
             "translate_threads": self.threads_var.get().strip(),
             "add_emoji": self.emoji_var.get(),
+            "snap_to_30fps": self.snap_30fps_var.get(),
         }
 
         self._is_running = True
@@ -818,4 +824,5 @@ class TranscribeTab(Tab):
             "add_emoji":           self.emoji_var.get(),
             "output_mode":         self.output_mode_var.get(),
             "batch_size":          self.batch_var.get().strip(),
+            "snap_to_30fps":       self.snap_30fps_var.get(),
         }
