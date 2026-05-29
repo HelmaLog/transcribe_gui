@@ -32,6 +32,29 @@ def _strip_model_marker(name: str) -> str:
 from .base import Tab, BG
 
 
+# Whisper 初始提示词默认值：一句带标点、大小写规范的英文，作为"上文"喂给模型，
+# 促使识别结果带标点符号与正确大小写（本工具源语音通常为英文）。可在界面里改/清空。
+_DEFAULT_INITIAL_PROMPT = (
+    "The following is a clear transcript with proper punctuation and capitalization."
+)
+
+_VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".ts", ".m4v", ".wmv")
+
+
+def _find_oldest_video(folder: str) -> str:
+    """返回目录中修改时间最早的视频文件路径（无则空串）。
+    用现有 SRT 翻译时源视频通常比生成的字幕更早，取最老的即原始视频。"""
+    try:
+        vids = [os.path.join(folder, f) for f in os.listdir(folder)
+                if f.lower().endswith(_VIDEO_EXTS)
+                and os.path.isfile(os.path.join(folder, f))]
+    except OSError:
+        return ""
+    if not vids:
+        return ""
+    return min(vids, key=os.path.getmtime)
+
+
 # ── Gemini key list widget ────────────────────────────────────────────────────
 
 class GeminiKeyListWidget(tk.Frame):
@@ -241,11 +264,27 @@ class TranscribeTab(Tab):
         self.chars_zh_var = tk.StringVar(value=cfg.get("max_chars_zh", "20"))
         oentry(self.chars_zh_var, 5)
 
-        self._lbl(p, "初始提示词（可选）").grid(row=10, column=0, sticky="w", padx=16, pady=(2, 0))
-        self.prompt_var = tk.StringVar(value=cfg["initial_prompt"])
-        tk.Entry(p, textvariable=self.prompt_var, bg="#252525", fg="#aaaaaa",
-                 insertbackground="white", relief="flat", font=("Segoe UI", 10), bd=4
-                 ).grid(row=11, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
+        # 初始提示词（可选）：默认折叠，避免占用空间；展开后可编辑/清空。
+        prompt_hdr = tk.Frame(p, bg=BG)
+        prompt_hdr.grid(row=10, column=0, sticky="ew", padx=16, pady=(2, 0))
+        prompt_hdr.columnconfigure(0, weight=1)
+        self._lbl(prompt_hdr, "初始提示词（可选，给 Whisper 的风格/上下文提示）"
+                  ).grid(row=0, column=0, sticky="w")
+        self._prompt_toggle_btn = tk.Button(
+            prompt_hdr, text="▶ 展开", command=self._toggle_prompt,
+            bg=BG, fg="#555555", relief="flat",
+            font=("Segoe UI", 8), padx=6, pady=0, cursor="hand2",
+            activebackground="#2a2a2a", activeforeground="#888888")
+        self._prompt_toggle_btn.grid(row=0, column=1, sticky="e")
+
+        self.prompt_var = tk.StringVar(
+            value=cfg.get("initial_prompt") or _DEFAULT_INITIAL_PROMPT)
+        self._prompt_entry = tk.Entry(
+            p, textvariable=self.prompt_var, bg="#252525", fg="#aaaaaa",
+            insertbackground="white", relief="flat", font=("Segoe UI", 10), bd=4)
+        self._prompt_entry.grid(row=11, column=0, sticky="ew", padx=16, pady=(2, 4), ipady=4)
+        self._prompt_expanded = False
+        self._prompt_entry.grid_remove()
 
         tk.Frame(p, bg="#333333", height=1).grid(row=12, column=0, sticky="ew", padx=16, pady=(8, 0))
 
@@ -420,6 +459,15 @@ class TranscribeTab(Tab):
         self._log_queue.put(msg)
 
     # ── Provider / output mode changes ───────────────────────────────────────
+
+    def _toggle_prompt(self):
+        self._prompt_expanded = not self._prompt_expanded
+        if self._prompt_expanded:
+            self._prompt_entry.grid()
+            self._prompt_toggle_btn.configure(text="▼ 收起")
+        else:
+            self._prompt_entry.grid_remove()
+            self._prompt_toggle_btn.configure(text="▶ 展开")
 
     def _on_output_mode_change(self):
         pass  # 翻译配置区常驻，不折叠，避免切换时界面跳动
@@ -775,6 +823,14 @@ class TranscribeTab(Tab):
             if matches:
                 srt_found = max(matches, key=os.path.getmtime)
                 break
+
+        # 用现有 SRT 翻译时没有选视频（video_path 为空）：
+        # 自动取字幕所在目录中最早的视频作为默认视频地址。
+        if not video_path:
+            folder = os.path.dirname(srt_found) if srt_found else result_dir
+            video_path = _find_oldest_video(folder)
+            if video_path:
+                self._log(f"🎬 已自动选用目录中最早的视频: {os.path.basename(video_path)}")
 
         burn_tab = getattr(self.app, "burn_tab", None)
         if burn_tab is None:

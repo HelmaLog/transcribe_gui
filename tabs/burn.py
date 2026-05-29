@@ -2339,7 +2339,10 @@ class BurnTab(Tab):
     # ── Public API ────────────────────────────────────────────────────────────
 
     def set_files(self, video_path: str, srt_path: str):
-        self.video_var.set(video_path or "")
+        # 仅在确有视频时覆盖；转写完成 handoff 若没带视频（例如用现有 SRT
+        # 翻译、未选视频），不要清空烧录页已经加载的视频地址。
+        if video_path:
+            self.video_var.set(video_path)
         if srt_path and os.path.exists(srt_path):
             self._add_to_srt_combo(srt_path)
         if video_path and os.path.exists(video_path):

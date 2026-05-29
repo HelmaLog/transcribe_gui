@@ -51,7 +51,7 @@ DEFAULT_CONFIG = {
     "language": "en",
     "max_chars_en": "42",
     "max_chars_zh": "20",
-    "initial_prompt": "",
+    "initial_prompt": "The following is a clear transcript with proper punctuation and capitalization.",
     "provider": "siliconflow",
     "api_key": "",
     "translate_model": DEFAULT_MODELS_SF[0],
