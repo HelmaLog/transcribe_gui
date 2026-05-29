@@ -184,7 +184,23 @@ class TranscribeTab(Tab):
         self._entry_row(p, 1, "Whisper 模型路径", self.model_var, self._browse_model)
 
         self.save_var = tk.StringVar()
-        self._entry_row(p, 2, "SRT 保存路径（空=与源文件同目录）", self.save_var, self._browse_save, "另存为")
+        self._save_lbl = tk.Label(p, text="SRT 保存路径  ▸ 点击另存为...",
+                                  bg=BG, fg="#888888", font=("Segoe UI", 9),
+                                  anchor="w", cursor="hand2")
+        self._save_lbl.grid(row=4, column=0, sticky="w", padx=16, pady=(8, 0))
+        self._save_lbl.bind("<Button-1>", lambda e: self._on_save_label_click())
+
+        self._save_frame = tk.Frame(p, bg=BG)
+        self._save_frame.grid(row=5, column=0, columnspan=3, sticky="ew", padx=16, pady=(2, 0))
+        self._save_frame.columnconfigure(0, weight=1)
+        tk.Entry(self._save_frame, textvariable=self.save_var, bg="#252525", fg="#aaaaaa",
+                 insertbackground="white", relief="flat", font=("Segoe UI", 10), bd=4,
+                 ).grid(row=0, column=0, sticky="ew", ipady=4)
+        tk.Button(self._save_frame, text="另存为", command=self._browse_save,
+                  bg="#3a3a3a", fg="#cccccc", relief="flat", padx=12,
+                  font=("Segoe UI", 9), cursor="hand2", activebackground="#4a4a4a",
+                  ).grid(row=0, column=1, padx=(6, 0))
+        self._save_frame.grid_remove()
 
         self.srt_var = tk.StringVar()
         srt_entry = self._entry_row(p, 3, "现有英文 SRT（可选，提供后跳过本地识别）", self.srt_var, self._browse_srt)
@@ -637,6 +653,14 @@ class TranscribeTab(Tab):
         path = filedialog.askdirectory(title="选择Whisper模型文件夹")
         if path:
             self.model_var.set(path)
+
+    def _on_save_label_click(self):
+        self._save_frame.grid()
+        self._save_lbl.configure(text="SRT 保存路径  ▾")
+        self._browse_save()
+        if not self.save_var.get():
+            self._save_frame.grid_remove()
+            self._save_lbl.configure(text="SRT 保存路径  ▸ 点击另存为...")
 
     def _browse_save(self):
         video = self.video_var.get().strip()
