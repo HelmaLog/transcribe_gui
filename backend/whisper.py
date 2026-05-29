@@ -43,6 +43,30 @@ def _fix_overlaps(subs) -> int:
     return count
 
 
+def _close_gaps(subs, max_gap_s: float = 1.0) -> int:
+    """
+    闭合相邻字幕之间的小空隙：将每条的 end 延伸到下一条的 start，
+    使字幕在时间上连续。这样烧录到视频后，字幕框不会在换气/句末这类
+    自然小停顿处消失再出现，避免画面闪烁/跳动。
+
+    仅向后延伸（不修改 start），且只在确有空隙时填补；与 _fix_overlaps
+    配合后，被闭合的相邻字幕满足 end == 下一条 start，时间轴严丝合缝。
+
+    max_gap_s：只闭合不超过该秒数的空隙。超过阈值的属于真实停顿
+    （说话明显停了），保留空白让字幕自然消失更符合观感，硬留反而滞留违和。
+    返回填补的空隙数。
+    """
+    count = 0
+    max_gap = timedelta(seconds=max_gap_s)
+    for i in range(len(subs) - 1):
+        nxt_start = subs[i + 1].start
+        gap = nxt_start - subs[i].end
+        if timedelta(0) < gap <= max_gap:
+            subs[i].end = nxt_start
+            count += 1
+    return count
+
+
 from .config import DEFAULT_MODELS_GEMINI
 from .translation import (
     translate_batch, translate_batch_ark, translate_batch_gemini, translate_batch_pioneer,
@@ -247,6 +271,10 @@ def run_transcribe(config, log, stop_event=None):
         n = _fix_overlaps(split_subs)
         if n:
             log(f"⚠️ 修复了英文字幕中 {n} 处时间戳重叠")
+        gap_max = float(config.get("close_gap_max_s", 1.0))
+        g = _close_gaps(split_subs, gap_max)
+        if g:
+            log(f"🔗 已闭合英文字幕中 {g} 处≤{gap_max:g}s 空隙，字幕连续无闪烁")
 
         # ── 保存英文字幕 ──
         # 从视频转写时始终保存；使用现有 SRT 且模式为"只生成英文"时也保存
@@ -341,6 +369,10 @@ def run_transcribe(config, log, stop_event=None):
                 n = _fix_overlaps(output_subs)
                 if n:
                     log(f"⚠️ 修复了{mode_name}字幕中 {n} 处时间戳重叠")
+                gap_max = float(config.get("close_gap_max_s", 1.0))
+                g = _close_gaps(output_subs, gap_max)
+                if g:
+                    log(f"🔗 已闭合{mode_name}字幕中 {g} 处≤{gap_max:g}s 空隙，字幕连续无闪烁")
                 out_path = os.path.join(save_dir, prefix + short_name + ".srt")
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(srt.compose(output_subs))
