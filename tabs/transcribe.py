@@ -2,6 +2,7 @@
 Transcribe tab — Whisper transcription + translation.
 """
 
+import glob as _glob
 import os
 import threading
 import queue
@@ -754,6 +755,7 @@ class TranscribeTab(Tab):
             if result_dir:
                 self._last_output_dir = result_dir
                 self._open_folder_btn.configure(state="normal")
+                self.app.after(0, lambda: self._handoff_to_burn(video, result_dir))
             self.btn.configure(state="normal", text="▶  开始")
             self.stop_btn.configure(state="disabled", text="⏹  停止")
 
@@ -763,6 +765,27 @@ class TranscribeTab(Tab):
         if self._stop_event:
             self._stop_event.set()
         self.stop_btn.configure(state="disabled", text="停止中...")
+
+    def _handoff_to_burn(self, video_path: str, result_dir: str):
+        """Switch to BurnTab and fill in video + SRT paths after transcription."""
+        # Find the best SRT: bilingual > chinese > english, newest first
+        srt_found = ""
+        for pattern in ("双语_*.srt", "部分双语_*.srt", "中文_*.srt", "部分中文_*.srt", "英文_*.srt"):
+            matches = _glob.glob(os.path.join(result_dir, pattern))
+            if matches:
+                srt_found = max(matches, key=os.path.getmtime)
+                break
+
+        burn_tab = getattr(self.app, "burn_tab", None)
+        if burn_tab is None:
+            return
+        burn_tab.set_files(video_path, srt_found)
+        # Switch notebook to the burn tab (index 2)
+        try:
+            nb = self.app._nb
+            nb.select(self.app.tabs.index(burn_tab))
+        except Exception:
+            pass
 
     def _open_output_folder(self):
         folder = self._last_output_dir

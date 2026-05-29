@@ -37,6 +37,7 @@ from tabs.transcribe import TranscribeTab
 from tabs.download   import DownloadTab
 from tabs.tweet      import TweetTab
 from tabs.compress   import CompressTab
+from tabs.burn       import BurnTab
 
 BG = "#1e1e1e"
 
@@ -70,6 +71,25 @@ class App(_TkBase):
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(150, lambda: _apply_dark_titlebar(self))
+        geo = self._saved_config.get("window_geometry", "")
+        if geo:
+            try:
+                self.geometry(geo)
+            except Exception:
+                pass
+        # Restore last active tab (default: 烧录 = index 2)
+        tab_idx = int(self._saved_config.get("active_tab", 2))
+        try:
+            self._nb.select(tab_idx)
+        except Exception:
+            self._nb.select(2)
+        # Ensure the window actually appears in front, not hidden in taskbar
+        self.after(100, self._bring_to_front)
+
+    def _bring_to_front(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
 
     # ── Style ─────────────────────────────────────────────────────────────────
     def _apply_style(self):
@@ -113,6 +133,7 @@ class App(_TkBase):
         _tab_defs = [
             ("  下 载  ", DownloadTab),
             ("  转 写  ", TranscribeTab),
+            ("  烧 录  ", BurnTab),
             ("  推 文  ", TweetTab),
             ("  压 缩  ", CompressTab),
         ]
@@ -123,7 +144,7 @@ class App(_TkBase):
             self._nb.add(frame, text=text)
             self.tabs.append(TabClass(self, frame))
 
-        self.download_tab, self.transcribe_tab, self.tweet_tab, self.compress_tab = self.tabs
+        self.download_tab, self.transcribe_tab, self.burn_tab, self.tweet_tab, self.compress_tab = self.tabs
 
     # ── Shared helpers ────────────────────────────────────────────────────────
     def get_api_key(self, provider: str):
@@ -134,6 +155,8 @@ class App(_TkBase):
         cfg = {}
         for tab in self.tabs:
             cfg.update(tab.get_config())
+        cfg["window_geometry"] = self.geometry()
+        cfg["active_tab"]      = self._nb.index("current")
         save_config(cfg)
 
     def _on_close(self):

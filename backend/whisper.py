@@ -26,16 +26,46 @@ def _snap_srt_to_30fps(subs):
     return subs
 
 
+def _fix_overlaps(subs) -> int:
+    """
+    确保相邻字幕不重叠：将前一条的 end 裁剪到下一条的 start。
+    对齐到帧边界时相邻字幕可能被推到同一帧，此函数作为最终保险。
+    返回修复的条数。
+    """
+    count = 0
+    min_dur = timedelta(milliseconds=round(_FRAME_MS))
+    for i in range(len(subs) - 1):
+        if subs[i].end > subs[i + 1].start:
+            new_end = subs[i + 1].start
+            # 保证本条至少维持一帧时长
+            subs[i].end = max(new_end, subs[i].start + min_dur)
+            count += 1
+    return count
+
+
 from .config import DEFAULT_MODELS_GEMINI
 from .translation import (
     translate_batch, translate_batch_ark, translate_batch_gemini, translate_batch_pioneer,
 )
 
 
+def _is_youtube_rolling(subs) -> bool:
+    """
+    YouTube 自动生成的滚动字幕特征：相邻字幕时间范围大量重叠。
+    检查前 30 对相邻字幕，若超过一半存在时间重叠则判定为滚动格式。
+    """
+    if len(subs) < 5:
+        return False
+    sample = min(len(subs) - 1, 30)
+    overlaps = sum(1 for i in range(1, sample + 1) if subs[i].start < subs[i - 1].end)
+    return overlaps / sample > 0.5
+
+
 def _flatten_youtube_subs(subs, srt_mod):
     """
     处理 YouTube 滚动字幕格式：提取每条唯一文字的首次出现时刻，
     以下一条新文字首次出现为结束，产生严格不重叠的干净字幕序列。
+    普通 SRT 文件不经过此函数——相同文字会被去重导致字幕丢失。
     """
     if not subs:
         return subs
@@ -114,9 +144,13 @@ def run_transcribe(config, log, stop_event=None):
             log(f"使用已有英文字幕: {os.path.basename(srt_path)}")
             with open(srt_path, "r", encoding="utf-8") as f:
                 raw_subs = list(srt.parse(f.read()))
-            log(f"已加载 {len(raw_subs)} 条字幕，处理 YouTube 滚动字幕格式...")
-            raw_subs = _flatten_youtube_subs(raw_subs, srt)
-            log(f"展开后 {len(raw_subs)} 条")
+            log(f"已加载 {len(raw_subs)} 条字幕")
+            if _is_youtube_rolling(raw_subs):
+                log("检测到 YouTube 滚动字幕格式，正在展开...")
+                raw_subs = _flatten_youtube_subs(raw_subs, srt)
+                log(f"展开后 {len(raw_subs)} 条")
+            else:
+                log("普通 SRT 格式，跳过滚动字幕处理")
             if output_mode == "chinese_only":
                 log("中文模式：保留原始段落，翻译后按中文字数切分")
                 for i, sub in enumerate(raw_subs, 1):
@@ -210,6 +244,9 @@ def run_transcribe(config, log, stop_event=None):
         snap = config.get("snap_to_30fps", False)
         if snap:
             _snap_srt_to_30fps(split_subs)
+        n = _fix_overlaps(split_subs)
+        if n:
+            log(f"⚠️ 修复了英文字幕中 {n} 处时间戳重叠")
 
         # ── 保存英文字幕 ──
         # 从视频转写时始终保存；使用现有 SRT 且模式为"只生成英文"时也保存
@@ -301,6 +338,9 @@ def run_transcribe(config, log, stop_event=None):
                     prefix = "部分双语_" if stopped else "双语_"
                 if snap:
                     _snap_srt_to_30fps(output_subs)
+                n = _fix_overlaps(output_subs)
+                if n:
+                    log(f"⚠️ 修复了{mode_name}字幕中 {n} 处时间戳重叠")
                 out_path = os.path.join(save_dir, prefix + short_name + ".srt")
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(srt.compose(output_subs))

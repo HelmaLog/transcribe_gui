@@ -10,3 +10,10 @@ __pycache__/
 .venv/
 venv/
 env/
+
+# 临时文件夹（截图、草稿等）
+temp/
+
+# 字体文件（仅保留项目默认字体，其余不提交）
+otf/*
+!otf/SourceHanSansCN-Bold.otf
