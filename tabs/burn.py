@@ -379,6 +379,11 @@ class BurnTab(Tab):
         if w > 1:
             self._paned.sash_place(0, int(w * self._sash_ratio), 0)
 
+    def _apply_saved_sash(self):
+        """重新把分栏摆到保存的比例。加载视频会扰动 PanedWindow 布局、
+        把 sash 重置回 50%，且不触发 <Configure>，故需在这些时点显式重应用。"""
+        _set_sash(self._paned, self._sash_ratio)
+
     def _on_sash_released(self, event):
         try:
             sash_x = self._paned.sash_coord(0)[0]
@@ -416,6 +421,8 @@ class BurnTab(Tab):
         srt   = cfg.get("burn_srt_path",   "")
         if video or srt:
             self.set_files(video, srt)
+            # 加载视频会把 sash 顶回 50%，稍后重应用保存的比例
+            self.frame.after(250, self._apply_saved_sash)
         if not self._ts_visible:
             self._toggle_timestamps()
 
@@ -2170,6 +2177,8 @@ class BurnTab(Tab):
                                 height=max(80, int(lw / self._video_aspect)))
                 except Exception:
                     pass
+                # 视频载入会把分栏顶回 50%，重应用保存的比例
+                self.app.after(0, self._apply_saved_sash)
             self._start_poll()
             self._schedule_preview_update()
             try:
