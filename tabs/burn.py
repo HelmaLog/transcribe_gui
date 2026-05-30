@@ -35,413 +35,24 @@ try:
 except ImportError:
     HAS_PILMOJI = False
 
-_PILMOJI_SRC_CACHE: list = [None, False]  # [source_cls, already_probed]
-_FONT_OBJ_CACHE:   dict  = {}             # (path_str, size) -> ImageFont
-
-
-def _has_emoji(text: str) -> bool:
-    """Quick check: does text contain any emoji codepoints?"""
-    for ch in text:
-        cp = ord(ch)
-        if (0x2300 <= cp <= 0x27BF or    # misc technical / dingbats
-                0x1F000 <= cp <= 0x1FAFF or  # main emoji / symbols block
-                0xFE00 <= cp <= 0xFE0F):     # variation selectors (emoji modifier)
-            return True
-    return False
-
 try:
     import av
     HAS_AV = True
 except ImportError:
     HAS_AV = False
 
-from .base import Tab, BG
+from .base import Tab, BG, HL_GREEN
+
+from .burn_render import (
+    _FONT_NAMES, _TEXT_COLORS, _BG_COLORS, _resolve_color, _hex_to_rgb,
+    _is_emoji, _ffmpeg_path, _td_to_ass_time, _write_ass, _banner_filter,
+    _make_subtitle_patch, _make_banner_patch,
+    render_subtitle_on_frame, render_banner_on_frame, _td_to_str, _ms_to_hms,
+)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-_FONT_NAMES = [
-    "Microsoft YaHei",
-    "SimHei",
-    "Source Han Sans CN Heavy",
-    "Source Han Sans CN Bold",
-    "Source Han Sans CN Medium",
-    "Source Han Sans CN Regular",
-    "Source Han Sans CN Light",
-    "Source Han Sans CN ExtraLight",
-    "Source Han Sans CN Normal",
-    "FZDaHei-B02",
-    "Arial Black",
-    "Impact",
-]
-
-_FONT_FILES = {
-    "Microsoft YaHei":              ["msyh.ttc", "msyh.ttf"],
-    "SimHei":                       ["simhei.ttf"],
-    "Source Han Sans CN Heavy":     ["SourceHanSansCN-Heavy.otf", "NotoSansCJKsc-Black.otf"],
-    "Source Han Sans CN Bold":      ["SourceHanSansCN-Bold.otf"],
-    "Source Han Sans CN Medium":    ["SourceHanSansCN-Medium.otf"],
-    "Source Han Sans CN Regular":   ["SourceHanSansCN-Regular.otf"],
-    "Source Han Sans CN Light":     ["SourceHanSansCN-Light.otf"],
-    "Source Han Sans CN ExtraLight":["SourceHanSansCN-ExtraLight.otf"],
-    "Source Han Sans CN Normal":    ["SourceHanSansCN-Normal.otf"],
-    "FZDaHei-B02":                  ["FZDHB02.TTF", "FZDH_B02.TTF"],
-    "Arial Black":                  ["ariblk.ttf"],
-    "Impact":                       ["impact.ttf"],
-}
-
-_TEXT_COLORS = {"白": "#ffffff", "黑": "#000000", "深灰": "#333333"}
-_BG_COLORS   = {"白": "#ffffff", "黑": "#000000", "黄": "#f5c518", "深灰": "#222222"}
-
 _ENCODER_CACHE = [None]
-
-
-# ── Module-level render helpers ────────────────────────────────────────────────
-
-_LOCAL_FONTS_DIR = Path(__file__).parent.parent / "otf"
-
-
-_FONT_PATH_CACHE: dict = {}
-
-def _find_font_path(family: str) -> str:
-    if family in _FONT_PATH_CACHE:
-        return _FONT_PATH_CACHE[family]
-    search_dirs = [_LOCAL_FONTS_DIR, Path("C:/Windows/Fonts")]
-    result = ""
-    for fname in _FONT_FILES.get(family, []):
-        for d in search_dirs:
-            p = d / fname
-            if p.exists():
-                result = str(p)
-                break
-        if result:
-            break
-    if not result:
-        stem = family.lower().replace(" ", "")[:5]
-        for d in search_dirs:
-            for ext in ["*.ttc", "*.ttf", "*.otf"]:
-                for f in d.glob(ext):
-                    if stem in f.stem.lower():
-                        result = str(f)
-                        break
-                if result:
-                    break
-            if result:
-                break
-    _FONT_PATH_CACHE[family] = result
-    return result
-
-
-# ── Emoji / mixed-font support ────────────────────────────────────────────────
-
-def _get_pilmoji_source():
-    """Return first working pilmoji source class (cached). None if unavailable."""
-    if _PILMOJI_SRC_CACHE[1]:
-        return _PILMOJI_SRC_CACHE[0]
-    _PILMOJI_SRC_CACHE[1] = True
-    if not HAS_PILMOJI or not HAS_PIL:
-        return None
-    candidates = []
-    for name in ("AppleEmojiSource", "TwitterEmojiSource", "GoogleEmojiSource"):
-        try:
-            import importlib
-            mod = importlib.import_module("pilmoji.source")
-            candidates.append(getattr(mod, name))
-        except Exception:
-            pass
-    try:
-        test_font = ImageFont.load_default()
-    except Exception:
-        test_font = None
-    for src_cls in candidates:
-        try:
-            dummy = Image.new("RGBA", (4, 4))
-            with Pilmoji(dummy, source=src_cls) as pm:
-                pm.getsize("😊", font=test_font)
-            _PILMOJI_SRC_CACHE[0] = src_cls
-            return src_cls
-        except Exception:
-            continue
-    return None
-
-
-_EMOJI_RANGES = (
-    (0x1F300, 0x1FAFF),  # Misc Symbols & Pictographs → Emoticons → Transport…
-    (0x2300,  0x23FF),   # Misc Technical (clocks, etc.)
-    (0x2600,  0x27BF),   # Misc Symbols, Dingbats
-    (0x2B00,  0x2BFF),   # Misc Symbols & Arrows
-    (0xFE00,  0xFE0F),   # Variation selectors (emoji presentation)
-    (0x200D,  0x200D),   # Zero-width joiner (compound emoji)
-    (0x20E3,  0x20E3),   # Combining enclosing keycap
-    (0x3297,  0x3299),   # Circled ideographs used as emoji
-)
-
-def _is_emoji(c: str) -> bool:
-    cp = ord(c)
-    return any(lo <= cp <= hi for lo, hi in _EMOJI_RANGES)
-
-
-def _emoji_runs(text: str):
-    """Split text into [(is_emoji, segment), ...] runs."""
-    if not text:
-        return []
-    runs: list = []
-    cur_emoji = _is_emoji(text[0])
-    cur = text[0]
-    for ch in text[1:]:
-        ie = _is_emoji(ch)
-        if ie == cur_emoji:
-            cur += ch
-        else:
-            runs.append((cur_emoji, cur))
-            cur_emoji, cur = ie, ch
-    runs.append((cur_emoji, cur))
-    return runs
-
-
-_EMOJI_FONT_CACHE: dict = {}
-
-def _get_emoji_font(size: int):
-    """Load Segoe UI Emoji at given size (cached). Returns None if unavailable."""
-    if size in _EMOJI_FONT_CACHE:
-        return _EMOJI_FONT_CACHE[size]
-    emoji_path = Path("C:/Windows/Fonts/seguiemj.ttf")
-    font = None
-    if HAS_PIL and emoji_path.exists():
-        try:
-            font = ImageFont.truetype(str(emoji_path), size)
-        except Exception:
-            font = None
-    _EMOJI_FONT_CACHE[size] = font
-    return font
-
-
-def _measure_line(line: str, font_main, font_emoji) -> tuple:
-    """Return (width, height) for a mixed-font line."""
-    w = h = 0
-    for is_emoji, seg in _emoji_runs(line):
-        f = font_emoji if (is_emoji and font_emoji) else font_main
-        try:
-            bb = f.getbbox(seg)
-            w += max(0, bb[2] - bb[0])
-            h  = max(h, max(0, bb[3] - bb[1]))
-        except Exception:
-            fallback_sz = getattr(f, "size", 14)
-            w += len(seg) * max(1, fallback_sz // 2)
-            h  = max(h, fallback_sz)
-    return max(1, w), max(1, h)
-
-
-def _draw_mixed_line(draw, x: int, y: int, line: str,
-                     font_main, font_emoji, fill: tuple):
-    """Draw a mixed-font line onto `draw` starting at (x, y)."""
-    for is_emoji, seg in _emoji_runs(line):
-        f = font_emoji if (is_emoji and font_emoji) else font_main
-        draw.text((x, y), seg, fill=fill, font=f)
-        try:
-            bb = f.getbbox(seg)
-            x += max(0, bb[2] - bb[0])
-        except Exception:
-            x += len(seg) * max(1, getattr(f, "size", 14) // 2)
-
-
-# ── Colour helpers ─────────────────────────────────────────────────────────────
-
-def _hex_to_rgb(hex_c: str) -> tuple:
-    h = hex_c.lstrip("#")
-    if len(h) == 3:
-        h = h[0]*2 + h[1]*2 + h[2]*2
-    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
-
-
-def _resolve_color(name_or_hex: str, color_map: dict) -> str:
-    return color_map.get(name_or_hex, name_or_hex)
-
-
-def _make_subtitle_patch(text: str, sp: dict,
-                          frame_w: int, frame_h: int):
-    """Render subtitle as a small RGBA patch. Returns (patch, (paste_x, paste_y))."""
-    if not HAS_PIL or not text or not text.strip():
-        return None, None
-
-    fp = _find_font_path(sp.get("font_family", "Microsoft YaHei"))
-    sz = sp.get("font_size", 28)
-    _font_key = (str(fp), sz)
-    font = _FONT_OBJ_CACHE.get(_font_key)
-    if font is None:
-        try:
-            font = ImageFont.truetype(fp, sz) if fp else ImageFont.load_default()
-        except Exception:
-            font = ImageFont.load_default()
-        _FONT_OBJ_CACHE[_font_key] = font
-
-    lines = text.strip().split("\n")
-    lsp   = sp.get("line_spacing", 8)
-    pad_x = sp.get("pad_x", 16)
-    pad_y = sp.get("pad_y", 8)
-
-    # Only use pilmoji when the text actually contains emoji characters.
-    # For plain text, PIL is called directly — avoids network/init overhead.
-    _pilmoji_src = _get_pilmoji_source()
-    _use_pilmoji = _pilmoji_src is not None and _has_emoji(text)
-    if _use_pilmoji:
-        try:
-            dummy = Image.new("RGBA", (1, 1))
-            line_bbs = []
-            with Pilmoji(dummy, source=_pilmoji_src) as pm:
-                for line in lines:
-                    w, h = pm.getsize(line, font=font)
-                    line_bbs.append((max(1, w), max(1, h)))
-        except Exception:
-            _use_pilmoji = False
-
-    if not _use_pilmoji:
-        emoji_font = _get_emoji_font(sz)
-        line_bbs = [_measure_line(line, font, emoji_font) for line in lines]
-
-    max_w   = max(w for w, _ in line_bbs) if line_bbs else sz
-    total_h = sum(h for _, h in line_bbs) + lsp * max(0, len(lines)-1)
-    box_w   = max_w + pad_x * 2
-    box_h   = total_h + pad_y * 2
-
-    patch = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
-    draw  = ImageDraw.Draw(patch)
-
-    bg_hex = _resolve_color(sp.get("bg_color", "黑"), _BG_COLORS)
-    br, bg_, bb_ = _hex_to_rgb(bg_hex)
-    a = int(sp.get("bg_alpha", 80) / 100 * 255)
-    r = sp.get("corner_radius", 8)
-    try:
-        draw.rounded_rectangle([0, 0, box_w, box_h], radius=r,
-                               fill=(br, bg_, bb_, a))
-    except AttributeError:
-        draw.rectangle([0, 0, box_w, box_h], fill=(br, bg_, bb_, a))
-
-    tc = _hex_to_rgb(_resolve_color(sp.get("text_color", "白"), _TEXT_COLORS))
-
-    # PIL 的 getbbox 返回 (x0, y0, x1, y1)，其中 y0 是绘制锚点到可见字形顶部的内部空隙。
-    # 若不补偿，顶部 padding 视觉上会比底部多出 y0 像素。
-    try:
-        _y_top_offset = max(0, font.getbbox("Ag")[1])
-    except Exception:
-        _y_top_offset = 0
-    ty = pad_y - _y_top_offset + sp.get("voffset", 0)
-
-    if _use_pilmoji:
-        try:
-            with Pilmoji(patch, source=_pilmoji_src) as pm:
-                for i, line in enumerate(lines):
-                    lw = line_bbs[i][0]
-                    tx = (box_w - lw) // 2
-                    pm.text((tx, ty), line, fill=tc, font=font)
-                    ty += line_bbs[i][1] + lsp
-        except Exception:
-            _use_pilmoji = False
-            ty = pad_y
-
-    if not _use_pilmoji:
-        emoji_font = _get_emoji_font(sz)
-        for i, line in enumerate(lines):
-            lw = line_bbs[i][0]
-            tx = (box_w - lw) // 2
-            _draw_mixed_line(draw, tx, ty, line, font, emoji_font, tc)
-            ty += line_bbs[i][1] + lsp
-
-    px = max(0, (frame_w - box_w) // 2)
-    py = max(0, frame_h - box_h - int(frame_h * 0.05))
-    return patch, (px, py)
-
-
-def _make_banner_patch(bp: dict, frame_w: int, frame_h: int):
-    """Render banner as an RGBA patch. Returns (patch, (paste_x, paste_y))."""
-    if not HAS_PIL:
-        return None, None
-    text = bp.get("text", "").strip()
-    if not text:
-        return None, None
-
-    fp = _find_font_path(bp.get("font_family", "Microsoft YaHei"))
-    sz = bp.get("font_size", 32)
-    try:
-        font = ImageFont.truetype(fp, sz) if fp else ImageFont.load_default()
-    except Exception:
-        font = ImageFont.load_default()
-
-    height   = bp.get("height", 60)
-    position = bp.get("position", "top")
-    align    = bp.get("align", "center")
-    tc_rgb   = _hex_to_rgb(bp.get("text_color", "#ffffff"))
-
-    patch = Image.new("RGBA", (frame_w, height),
-                      _hex_to_rgb(bp.get("bg_color", "#1a1a2e")) + (255,))
-    draw  = ImageDraw.Draw(patch)
-
-    # y_top_offset: gap between PIL draw origin and actual visible glyph top
-    try:
-        _y_top_offset = max(0, font.getbbox("Ag")[1])
-    except Exception:
-        _y_top_offset = 0
-
-    _pilmoji_src = _get_pilmoji_source()
-    tw, th = sz * max(1, len(text)) // 2, sz
-    if _pilmoji_src:
-        try:
-            dummy = Image.new("RGBA", (1, 1))
-            with Pilmoji(dummy, source=_pilmoji_src) as pm:
-                tw, th = pm.getsize(text, font=font)
-        except Exception:
-            _pilmoji_src = None
-    if not _pilmoji_src:
-        try:
-            bb = font.getbbox(text)
-            tw, th = bb[2] - bb[0], bb[3] - bb[1]
-        except Exception:
-            pass
-
-    # Visually center: account for y_top_offset so top/bottom gap are equal
-    ty = (height - th) // 2 - _y_top_offset + bp.get("voffset", 0)
-    if align == "left":
-        tx = 16
-    elif align == "right":
-        tx = frame_w - tw - 16
-    else:
-        tx = (frame_w - tw) // 2
-
-    if _pilmoji_src:
-        try:
-            with Pilmoji(patch, source=_pilmoji_src) as pm:
-                pm.text((tx, ty), text, fill=tc_rgb + (255,), font=font)
-        except Exception:
-            draw.text((tx, ty + _y_top_offset), text, fill=tc_rgb + (255,), font=font)
-    else:
-        draw.text((tx, ty), text, fill=tc_rgb + (255,), font=font)
-
-    py = 0 if position == "top" else frame_h - height
-    return patch, (0, py)
-
-
-def render_subtitle_on_frame(img: "Image.Image", text: str, sp: dict) -> "Image.Image":
-    """Draw subtitle box on a PIL image. Used for preview only."""
-    if not HAS_PIL or not text or not text.strip():
-        return img
-    patch, pos = _make_subtitle_patch(text, sp, img.width, img.height)
-    if patch is None:
-        return img
-    out = img.convert("RGBA")
-    out.paste(patch, pos, patch)
-    return out.convert("RGB")
-
-
-def render_banner_on_frame(img: "Image.Image", bp: dict) -> "Image.Image":
-    """Draw banner on a PIL image."""
-    if not HAS_PIL:
-        return img
-    if not bp.get("text", "").strip():
-        return img
-    img = img.convert("RGBA")
-    patch, pos = _make_banner_patch(bp, img.width, img.height)
-    if patch is not None:
-        img.paste(patch, pos)
-    return img.convert("RGB")
 
 
 def _detect_encoder() -> str:
@@ -478,136 +89,22 @@ def _detect_encoder() -> str:
     return _ENCODER_CACHE[0]
 
 
-def _subs_at(subs, t_sec: float) -> str:
-    t = timedelta(seconds=t_sec)
-    for sub in subs:
-        if sub.start <= t <= sub.end:
-            return sub.content
-    return ""
-
-
-def _hex_to_ass_color(hex_c: str, alpha: int = 0) -> str:
-    """#RRGGBB → ASS &HAABBGGRR  (alpha: 0=opaque, 255=transparent)."""
-    h = hex_c.lstrip("#")
-    if len(h) == 3:
-        h = h[0]*2 + h[1]*2 + h[2]*2
-    return f"&H{alpha:02X}{h[4:6]}{h[2:4]}{h[0:2]}"
-
-
-def _td_to_ass_time(td) -> str:
-    total_cs = int(td.total_seconds() * 100)
-    cs = total_cs % 100
-    s  = (total_cs // 100) % 60
-    m  = (total_cs // 6000) % 60
-    h  = total_cs // 360000
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
-
-
-def _ffmpeg_path(path: str) -> str:
-    """Convert path to forward-slash form for use inside single-quoted ffmpeg filter values."""
-    return path.replace("\\", "/")
-
-
-def _write_ass(subs, sp: dict, out_w: int, out_h: int) -> str:
-    """Convert SRT subtitles + style params into a temp ASS file. Returns file path."""
-    font  = sp.get("font_family", "Microsoft YaHei")
-    size  = sp.get("font_size",   28)
-    bold  = 1 if sp.get("bold") else 0
-    lsp   = sp.get("line_spacing", 8)
-    padx  = sp.get("pad_x", 16)
-    pady  = sp.get("pad_y", 8)
-
-    tc_hex       = _resolve_color(sp.get("text_color", "白"), _TEXT_COLORS)
-    bc_hex       = _resolve_color(sp.get("bg_color",   "黑"), _BG_COLORS)
-    bg_alpha_pct = sp.get("bg_alpha", 80)
-    bg_alpha_ass = int((1 - bg_alpha_pct / 100) * 255)
-
-    text_color_ass = _hex_to_ass_color(tc_hex, 0)
-    bg_color_ass   = _hex_to_ass_color(bc_hex, bg_alpha_ass)
-    outline        = max(1, min(pady, padx // 2))
-    margin_v       = max(10, int(out_h * 0.04))
-
-    header = (
-        "[Script Info]\n"
-        "ScriptType: v4.00+\n"
-        f"PlayResX: {out_w}\n"
-        f"PlayResY: {out_h}\n"
-        "WrapStyle: 0\n"
-        "ScaledBorderAndShadow: yes\n\n"
-        "[V4+ Styles]\n"
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
-        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
-        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{font},{size},{text_color_ass},{text_color_ass},"
-        f"{bg_color_ass},{bg_color_ass},{bold},0,0,0,100,100,{lsp},0,3,"
-        f"{outline},0,2,10,10,{margin_v},1\n\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-    )
-
-    events = []
-    for sub in subs:
-        s = _td_to_ass_time(sub.start)
-        e = _td_to_ass_time(sub.end)
-        t = sub.content.strip().replace("\n", "\\N")
-        events.append(f"Dialogue: 0,{s},{e},Default,,0,0,0,,{t}\n")
-
-    fd, path = tempfile.mkstemp(suffix=".ass")
-    with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
-        f.write(header)
-        f.writelines(events)
-    return path
-
-
-def _banner_filter(bp: dict, out_w: int, out_h: int) -> str:
-    """Build ffmpeg drawbox+drawtext filter string for the fixed banner."""
-    text = bp.get("text", "").strip()
-    if not text:
-        return ""
-
-    height   = bp.get("height",    60)
-    position = bp.get("position",  "top")
-    align    = bp.get("align",     "center")
-    font_sz  = bp.get("font_size", 32)
-    tc_hex   = bp.get("text_color", "#ffffff").lstrip("#")
-    bc_hex   = bp.get("bg_color",  "#1a1a2e").lstrip("#")
-
-    box_y  = "0"        if position == "top" else f"ih-{height}"
-    text_y = (f"({height}-text_h)/2"
-              if position == "top"
-              else f"ih-{height}+({height}-text_h)/2")
-
-    if align == "left":
-        text_x = "16"
-    elif align == "right":
-        text_x = "w-text_w-16"
-    else:
-        text_x = "(w-text_w)/2"
-
-    t  = text.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
-    fp = _find_font_path(bp.get("font_family", "Microsoft YaHei"))
-    font_arg = f":fontfile='{_ffmpeg_path(fp)}'" if fp else ""
-
-    box   = (f"drawbox=x=0:y={box_y}:w=iw:h={height}"
-             f":color=0x{bc_hex}ff@1.0:t=fill")
-    dtext = (f"drawtext=text='{t}':fontsize={font_sz}{font_arg}"
-             f":fontcolor=0x{tc_hex}:x={text_x}:y={text_y}")
-    return f"{box},{dtext}"
-
-
-
-
 def _verify_av_encoder(encoder: str, fps_rate, out_w: int, out_h: int,
                         vbitrate: int) -> bool:
-    """Return True if the encoder can be opened successfully by PyAV."""
+    """Return True if the encoder can be opened successfully by PyAV.
+
+    必须用实际输出尺寸校验：硬件编码器（尤其 AMD AMF）会拒绝过小的画面
+    （16×16 直接 Init 失败），用真实分辨率才不会把可用的硬编误判为不可用。
+    """
+    w = max(64, int(out_w) & ~1)
+    h = max(64, int(out_h) & ~1)
     fd, tmp = tempfile.mkstemp(suffix=".mp4")
     os.close(fd)
     try:
         with av.open(tmp, "w") as c:
             s = c.add_stream(encoder, rate=fps_rate)
-            s.width, s.height, s.pix_fmt = 16, 16, "yuv420p"
-            f = av.VideoFrame(16, 16, "yuv420p")
+            s.width, s.height, s.pix_fmt = w, h, "yuv420p"
+            f = av.VideoFrame(w, h, "yuv420p")
             f.pts = 0
             for p in s.encode(f):
                 c.mux(p)
@@ -621,6 +118,29 @@ def _verify_av_encoder(encoder: str, fps_rate, out_w: int, out_h: int,
             os.remove(tmp)
         except OSError:
             pass
+
+
+def _verify_encoder_cli(ffmpeg_exe: str, encoder: str,
+                        out_w: int, out_h: int) -> bool:
+    """用系统 ffmpeg CLI 在真实输出尺寸下校验编码器能否打开。
+
+    圆角/直角路径的实际编码都由系统 ffmpeg.exe 完成，所以校验也应用同一套
+    工具、同一尺寸——而不是用 PyAV（其内置 ffmpeg 与系统版本可能不一致）。
+    """
+    import subprocess
+    w = max(64, int(out_w) & ~1)
+    h = max(64, int(out_h) & ~1)
+    try:
+        r = subprocess.run(
+            [ffmpeg_exe, "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", f"nullsrc=s={w}x{h}:d=0.1",
+             "-c:v", encoder, "-frames:v", "1", "-f", "null", "-"],
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            timeout=20)
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 def _set_av_encoder_opts(stream, encoder: str) -> None:
@@ -697,6 +217,10 @@ class BurnTab(Tab):
         self._loop_end_ms    = 0
         self._loop_poll_id   = None
         self._sub_looping    = False
+        self._seg_looping      = False
+        self._seg_loop_start   = 0
+        self._seg_loop_end     = 0
+        self._seg_loop_poll_id = None
         self._reloading_subs = False
         self._edit_was_playing = False
         self._last_srt_scan_folder = ""
@@ -711,10 +235,19 @@ class BurnTab(Tab):
         self._burn_thread = None
         self._burn_start_time = None
         self._is_running = False
+        self._segments = []          # [(start_ms, end_ms)] 已确认片段；空=全程烧录
+        self._seg_mark_start = None  # 已标记起点、待标记终点的临时值（ms）
         cfg = self.app._saved_config
         self._vlc_sub_color = cfg.get("burn_vlc_sub_color", "#ffff00")
         self._sash_ratio = float(cfg.get("burn_sash_ratio", 0.60))
         self._ts_visible = bool(cfg.get("burn_ts_visible", True))
+        for _it in cfg.get("burn_segments", []):
+            try:
+                _a, _b = int(_it[0]), int(_it[1])
+                if _b > _a:
+                    self._segments.append((_a, _b))
+            except (TypeError, ValueError, IndexError):
+                pass
 
         self._init_style_vars(cfg)
 
@@ -732,7 +265,7 @@ class BurnTab(Tab):
         left = self._left_pane
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=0)
-        left.rowconfigure(2, weight=1)
+        left.rowconfigure(3, weight=1)
 
         self._video_frame = tk.Frame(left, bg="#000000", height=220)
         self._video_frame.grid(row=0, column=0, sticky="ew")
@@ -756,8 +289,12 @@ class BurnTab(Tab):
         ctrl.grid(row=1, column=0, sticky="ew", pady=(2, 2))
         self._build_controls(ctrl)
 
+        seg_bar = tk.Frame(left, bg=BG)
+        seg_bar.grid(row=2, column=0, sticky="ew", pady=(0, 2))
+        self._build_segments(seg_bar)
+
         tree_frame = tk.Frame(left, bg=BG)
-        tree_frame.grid(row=2, column=0, sticky="nsew")
+        tree_frame.grid(row=3, column=0, sticky="nsew")
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
         self._build_tree(tree_frame)
@@ -948,12 +485,210 @@ class BurnTab(Tab):
             row=0, column=8, sticky="ns", pady=4, padx=(2, 4))
         tk.Label(p, text="字幕色", bg="#161616", fg="#555555",
                  font=("Segoe UI", 8)).grid(row=0, column=9, padx=(0, 3))
-        self._vlc_color_btn = tk.Button(
-            p, text="  ", command=self._pick_vlc_sub_color,
-            bg=self._vlc_sub_color, relief="flat",
-            font=("Segoe UI", 8), padx=10, pady=2,
-            cursor="hand2", activebackground="#cccc00")
-        self._vlc_color_btn.grid(row=0, column=10, padx=(0, 6), pady=4)
+        self._vlc_color_btn = tk.Label(
+            p, text="●", fg=self._vlc_sub_color, bg="#161616",
+            font=("Segoe UI", 13), cursor="hand2")
+        self._vlc_color_btn.bind("<Button-1>", lambda e: self._pick_vlc_sub_color())
+        self._vlc_color_btn.grid(row=0, column=10, padx=(0, 8), pady=4)
+
+    # ── Segments (time-range) ───────────────────────────────────────────────────
+
+    def _build_segments(self, p):
+        # 列 99 作为弹性占位，把状态标签推到最右
+        p.columnconfigure(99, weight=1)
+
+        tk.Label(p, text="✂ 时间片段", bg=BG, fg="#888888",
+                 font=("Segoe UI", 8)).grid(row=0, column=0, padx=(2, 6), pady=(2, 2))
+
+        def _mk(text, cmd, col, fg="#cccccc"):
+            b = tk.Button(p, text=text, command=cmd,
+                          bg="#2a2a2a", fg=fg, relief="flat",
+                          font=("Segoe UI", 8), padx=8, pady=1, cursor="hand2",
+                          activebackground="#3a3a3a", activeforeground="#ffffff")
+            b.grid(row=0, column=col, padx=(0, 4), pady=(2, 2))
+            return b
+
+        self._seg_start_btn = _mk("● 标记起点", self._mark_seg_start, 1, fg="#d8a657")
+        self._seg_end_btn   = _mk("■ 标记终点", self._mark_seg_end,   2, fg="#7daea3")
+        self._seg_clear_btn = _mk("清除",       self._clear_segments, 3, fg="#999999")
+
+        self._seg_status = tk.Label(p, text="", bg=BG, fg="#666666",
+                                    font=("Segoe UI", 8), anchor="e")
+        self._seg_status.grid(row=0, column=99, sticky="e", padx=(6, 4))
+
+        self._seg_chips = _ItemFlowFrame(p, bg=BG)
+        self._seg_chips.grid(row=1, column=0, columnspan=100,
+                             sticky="ew", padx=2, pady=(0, 2))
+
+        self._refresh_seg_chips()
+
+    def _current_player_ms(self):
+        """当前播放位置（ms）；无法获取时返回 None。"""
+        if not self._player:
+            return None
+        try:
+            t = self._player.get_time()
+        except Exception:
+            return None
+        if t is None or t < 0:
+            return None
+        return int(t)
+
+    def _flash_seg_status(self, msg: str):
+        self._seg_status.configure(text=msg, fg="#cc6666")
+        self.app.after(2500, self._update_seg_status)
+
+    def _update_seg_status(self):
+        if self._seg_mark_start is not None:
+            self._seg_status.configure(
+                text=f"起点 {_ms_to_hms(self._seg_mark_start)} → 待标记终点",
+                fg="#d8a657")
+        elif self._segments:
+            total = sum(b - a for a, b in self._segments)
+            self._seg_status.configure(
+                text=f"{len(self._segments)} 段 / 保留 {_ms_to_hms(total)}",
+                fg=HL_GREEN)
+        else:
+            self._seg_status.configure(text="", fg="#666666")
+
+    def _refresh_seg_chips(self):
+        fr = self._seg_chips
+        for ch in fr.winfo_children():
+            ch.destroy()
+        fr._cells.clear()
+
+        self._segments.sort()
+        if not self._segments:
+            lbl = tk.Label(fr, text="全程烧录（未设置片段）", bg=BG, fg="#555555",
+                           font=("Segoe UI", 8))
+            fr.add(lbl)
+        else:
+            for i, (a, b) in enumerate(self._segments, 1):
+                cell = tk.Frame(fr, bg="#1e2a33")
+                t = tk.Label(cell, text=f"{i}  {_ms_to_hms(a)} → {_ms_to_hms(b)}",
+                             bg="#1e2a33", fg="#aaccdd", font=("Segoe UI", 8),
+                             cursor="hand2", padx=6, pady=1)
+                t.pack(side="left")
+                t.bind("<Button-1>",
+                       lambda e, s=a, en=b: self._preview_segment(s, en))
+                x = tk.Label(cell, text="✕", bg="#1e2a33", fg="#cc6666",
+                             font=("Segoe UI", 8), cursor="hand2", padx=4)
+                x.pack(side="left")
+                x.bind("<Button-1>", lambda e, s=a, en=b: self._delete_segment(s, en))
+                fr.add(cell)
+
+        fr.after_idle(fr._reflow)
+        self._update_seg_status()
+
+    def _mark_seg_start(self):
+        t = self._current_player_ms()
+        if t is None:
+            self._flash_seg_status("无法获取当前时间（先加载并播放视频）")
+            return
+        self._seg_mark_start = t
+        self._update_seg_status()
+
+    def _mark_seg_end(self):
+        t = self._current_player_ms()
+        if t is None:
+            self._flash_seg_status("无法获取当前时间")
+            return
+        if self._seg_mark_start is None:
+            self._flash_seg_status("请先标记起点")
+            return
+        a, b = self._seg_mark_start, t
+        if b < a:                      # 容错：终点早于起点则交换
+            a, b = b, a
+        if b - a < 200:
+            self._flash_seg_status("片段太短（<0.2s）")
+            return
+        self._segments.append((a, b))
+        self._seg_mark_start = None
+        self._refresh_seg_chips()
+
+    def _delete_segment(self, start_ms, end_ms):
+        try:
+            self._segments.remove((start_ms, end_ms))
+        except ValueError:
+            return
+        self._stop_seg_loop()
+        self._refresh_seg_chips()
+
+    def _clear_segments(self, silent: bool = False):
+        if not silent and not self._segments and self._seg_mark_start is None:
+            return
+        self._stop_seg_loop()
+        self._segments = []
+        self._seg_mark_start = None
+        if hasattr(self, "_seg_chips"):
+            self._refresh_seg_chips()
+
+    def _preview_segment(self, start_ms, end_ms):
+        """点击片段：在 [起点, 终点] 间循环播放，便于核对边界切得准不准。
+        再次点击同一片段则停止循环。"""
+        if not self._player:
+            return
+        s = int(start_ms)
+        e = max(int(end_ms), s + 200)
+        # 再次点击正在循环的同一片段 → 停止（提供一个不依赖其他操作的关闭方式）
+        if self._seg_looping and self._seg_loop_start == s and self._seg_loop_end == e:
+            self._stop_seg_loop()
+            return
+        self._stop_sub_loop()        # 与字幕编辑循环互斥
+        self._seg_loop_start = s
+        self._seg_loop_end   = e
+        self._seg_looping    = True
+        if self._seg_loop_poll_id:
+            self.app.after_cancel(self._seg_loop_poll_id)
+            self._seg_loop_poll_id = None
+        try:
+            self._player.set_time(s)
+            if not self._player.is_playing():
+                self._player.play()
+                self._play_btn.configure(text="⏸")
+        except Exception:
+            pass
+        self._seg_loop_poll_id = self.app.after(100, self._seg_loop_tick)
+
+    def _seg_loop_tick(self):
+        self._seg_loop_poll_id = None
+        if not self._seg_looping or not self._player:
+            return
+        try:
+            t = self._player.get_time()
+        except Exception:
+            t = -1
+        if t < 0 or t >= self._seg_loop_end:
+            try:
+                self._player.set_time(self._seg_loop_start)
+                if not self._player.is_playing():
+                    self._player.play()
+                    self._play_btn.configure(text="⏸")
+            except Exception:
+                pass
+        self._seg_loop_poll_id = self.app.after(100, self._seg_loop_tick)
+
+    def _stop_seg_loop(self):
+        self._seg_looping = False
+        if self._seg_loop_poll_id:
+            self.app.after_cancel(self._seg_loop_poll_id)
+            self._seg_loop_poll_id = None
+
+    def _segments_for_burn(self):
+        """合并重叠、按时间排序后的 [(start_s, end_s)]；空列表表示全程烧录。
+
+        第三步（裁剪烧录）从此处取片段，保证传给编码流水线的区间不重叠、有序。
+        """
+        if not self._segments:
+            return []
+        segs = sorted(self._segments)
+        merged = [list(segs[0])]
+        for a, b in segs[1:]:
+            if a <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        return [(a / 1000.0, b / 1000.0) for a, b in merged]
 
     # ── Treeview ──────────────────────────────────────────────────────────────
 
@@ -1079,7 +814,7 @@ class BurnTab(Tab):
         srt_hdr.columnconfigure(1, weight=1)
         srt_hdr.grid(row=r, column=0, sticky="ew", padx=12, pady=(8, 0))
         self._lbl(srt_hdr, "SRT 字幕文件").grid(row=0, column=0, sticky="w")
-        self._status_lbl = tk.Label(srt_hdr, text="", bg=BG, fg="#5a9a5a",
+        self._status_lbl = tk.Label(srt_hdr, text="", bg=BG, fg=HL_GREEN,
                                     font=("Segoe UI", 9), anchor="e")
         self._status_lbl.grid(row=0, column=1, sticky="e", padx=(8, 0))
         r += 1
@@ -1439,10 +1174,10 @@ class BurnTab(Tab):
         preset_outer.columnconfigure(0, weight=1)
 
         _presets = [
-            ("fast",     "🚀 极速",    "720p · 2.5 Mbps · 文件最小"),
-            ("balanced", "⚖️ 均衡",   "1080p · 8 Mbps · 推荐"),
-            ("quality",  "💎 最高画质", "原始分辨率 · 15 Mbps"),
-            ("custom",   "🔧 自定义",  "手动设置分辨率 / 码率"),
+            ("fast",     "🚀 极速",    "720p · 30fps · 2.5 Mbps · 文件最小"),
+            ("balanced", "⚖️ 均衡",   "1080p · 30fps · 8 Mbps · 推荐"),
+            ("quality",  "💎 最高画质", "原始分辨率 · 原始帧率 · 15 Mbps"),
+            ("custom",   "🔧 自定义",  "手动设置分辨率 / 码率（帧率随源）"),
         ]
         for i, (key, label, desc) in enumerate(_presets):
             row_bg = "#252525"
@@ -1522,11 +1257,13 @@ class BurnTab(Tab):
         prog_f = tk.Frame(p, bg=BG)
         prog_f.columnconfigure(0, weight=1)
         prog_f.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 4))
-        self._progress = ttk.Progressbar(prog_f, mode="determinate")
-        self._progress.grid(row=0, column=0, sticky="ew")
+        # 进度/完成明细写在进度条「上方」（row=0），进度条在下方（row=1）
         self._burn_prog_label = tk.Label(prog_f, text="", bg=BG, fg="#888888",
-                                         font=("Segoe UI", 8))
-        self._burn_prog_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
+                                         font=("Segoe UI", 8), justify="left",
+                                         anchor="w")
+        self._burn_prog_label.grid(row=0, column=0, sticky="w", pady=(0, 3))
+        self._progress = ttk.Progressbar(prog_f, mode="determinate")
+        self._progress.grid(row=1, column=0, sticky="ew")
         r += 1
 
         # Log area
@@ -1848,8 +1585,10 @@ class BurnTab(Tab):
             from backend.compress import detect_hw_encoder
             enc, desc = detect_hw_encoder()
             self._burn_encoder = enc
-            self.app.after(0, lambda: self._encoder_lbl.configure(
-                text=f"编码器: {desc}"))
+            # GPU 硬件编码用亮绿色突出（CPU 软编保持灰色，便于一眼区分）
+            _fg = HL_GREEN if enc != "libx264" else "#888888"
+            self.app.after(0, lambda d=desc, c=_fg: self._encoder_lbl.configure(
+                text=f"编码器: {d}", fg=c))
         threading.Thread(target=_do, daemon=True).start()
 
     # ── Player: play / pause / seek / volume ──────────────────────────────────
@@ -1857,6 +1596,7 @@ class BurnTab(Tab):
     def _toggle_play(self):
         if not self._player:
             return
+        self._stop_seg_loop()   # 用户手动播放/暂停 → 退出片段循环，不再抢控制
         if self._player.is_playing():
             t_ms = self._player.get_time()       # 暂停前采集——暂停后 VLC 内部时钟会漂回一段
             self._player.pause()
@@ -1867,12 +1607,20 @@ class BurnTab(Tab):
         else:
             self._preview_t_sec = None           # 开始播放，清除点击缓存
             self._preview_label.place_forget()   # 播放时移开预览层，让 VLC 透出
+            # 播放到结尾后 VLC 处于 Ended 状态，此时直接 play() 无效，
+            # 必须先 stop() 复位，再 play() 才能从头重新播放。
+            try:
+                if self._player.get_state() == vlc.State.Ended:
+                    self._player.stop()
+            except Exception:
+                pass
             self._player.play()
             self._play_btn.configure(text="⏸")
             self._start_poll()
 
     def _seek_press_cmd(self):
         self._dragging_seek = True
+        self._stop_seg_loop()   # 用户拖动进度条 → 退出片段循环
 
     def _seek_drag_cmd(self, value):
         if self._player and self._duration_ms > 0:
@@ -1958,9 +1706,7 @@ class BurnTab(Tab):
         _, hex_c = colorchooser.askcolor(color=self._vlc_sub_color, title="选择 VLC 字幕颜色")
         if hex_c:
             self._vlc_sub_color = hex_c
-            r, g, b = _hex_to_rgb(hex_c)
-            fg = "#000000" if (r * 299 + g * 587 + b * 114) > 128000 else "#ffffff"
-            self._vlc_color_btn.configure(bg=hex_c, activebackground=hex_c, fg=fg)
+            self._vlc_color_btn.configure(fg=hex_c)
             self._reload_vlc_subs()
 
     # ── Timestamp column toggle ───────────────────────────────────────────────
@@ -2112,6 +1858,7 @@ class BurnTab(Tab):
     # ── Subtitle loop during inline edit ─────────────────────────────────────
 
     def _start_sub_loop(self, start_ms: int, end_ms: int):
+        self._stop_seg_loop()   # 与片段预览循环互斥
         self._loop_start_ms = start_ms
         self._loop_end_ms   = max(end_ms, start_ms + 200)
         self._sub_looping   = True
@@ -2271,6 +2018,12 @@ class BurnTab(Tab):
                 self._player.video_set_subtitle_file(srt_src)
             return
 
+        # 换成了另一个视频：旧片段基于上一个视频的时间轴，已失效。
+        # 注意 self._loaded_video_path 此刻仍是上一个路径——首次加载（含启动
+        # 恢复）时它为空，条件不成立，从而保留从配置恢复的片段。
+        if self._loaded_video_path and self._segments:
+            self._clear_segments(silent=True)
+
         self._loaded_video_path = path
         media = self._instance.media_new(path)
         if srt_src and os.path.exists(srt_src):
@@ -2343,11 +2096,13 @@ class BurnTab(Tab):
         # 翻译、未选视频），不要清空烧录页已经加载的视频地址。
         if video_path:
             self.video_var.set(video_path)
-        if srt_path and os.path.exists(srt_path):
-            self._add_to_srt_combo(srt_path)
+        # 先加载视频并扫描其目录（_scan_srt_options 可能改/清空字幕选择），
+        # 之后再设置显式传入的字幕，确保它最终胜出、不被目录扫描冲掉。
         if video_path and os.path.exists(video_path):
             self._scan_srt_options(video_path)
             self._load_video(video_path)
+        if srt_path and os.path.exists(srt_path):
+            self._add_to_srt_combo(srt_path)
 
     def load_srt(self, srt_path: str):
         self._tree.delete(*self._tree.get_children())
@@ -2383,7 +2138,7 @@ class BurnTab(Tab):
         v = self.video_var.get().strip()
         s = self.srt_var.get().strip()
         if v and s and os.path.exists(v) and os.path.exists(s):
-            self._status_lbl.configure(text="✅ 已就绪")
+            self._status_lbl.configure(text="✅ 已就绪", fg=HL_GREEN)
             self._burn_btn.configure(state="normal")
             if hasattr(self, "_burn_out_var") and not self._burn_out_var.get().strip():
                 self._burn_out_var.set(self._suggest_output(v))
@@ -2564,6 +2319,7 @@ class BurnTab(Tab):
             "burn_preset":       self._burn_preset_var.get(),
             "burn_res":          self._burn_res_var.get(),
             "burn_vbitrate":     self._burn_vbitrate_var.get(),
+            "burn_segments":     [[a, b] for a, b in self._segments],
         }
 
     # ── Burn ──────────────────────────────────────────────────────────────────
@@ -2605,10 +2361,12 @@ class BurnTab(Tab):
 
         # Resolve output quality params from preset
         preset = self._burn_preset_var.get()
+        # fps_cap：输出帧率上限（None=保留源帧率）。字幕视频 30fps 足够，
+        # 极速/均衡封顶 30fps，可把 60fps 源的编码量直接砍半；最高画质保留源帧率。
         _preset_map = {
-            "fast":     {"scale": (1280, 720),  "vbitrate": 2500},
-            "balanced": {"scale": (1920, 1080), "vbitrate": 8000},
-            "quality":  {"scale": None,          "vbitrate": 15000},
+            "fast":     {"scale": (1280, 720),  "vbitrate": 2500,  "fps_cap": 30},
+            "balanced": {"scale": (1920, 1080), "vbitrate": 8000,  "fps_cap": 30},
+            "quality":  {"scale": None,          "vbitrate": 15000, "fps_cap": None},
         }
         if preset == "custom":
             try:
@@ -2625,7 +2383,7 @@ class BurnTab(Tab):
                     scale = (int(w), int(h))
                 except Exception:
                     scale = None
-            quality_params = {"scale": scale, "vbitrate": vbr}
+            quality_params = {"scale": scale, "vbitrate": vbr, "fps_cap": None}
         else:
             quality_params = _preset_map.get(preset, _preset_map["balanced"])
 
@@ -2645,10 +2403,12 @@ class BurnTab(Tab):
         self._burn_start_time = None
         self._burn_stop = threading.Event()
 
+        clip_ranges = self._segments_for_burn()   # [] 表示全程
+
         self._burn_thread = threading.Thread(
             target=self._do_burn,
             args=(vp, Path(srt_path), sp, bp, with_banner, out_path, encoder,
-                  quality_params),
+                  quality_params, clip_ranges),
             daemon=True)
         self._burn_thread.start()
 
@@ -2663,7 +2423,8 @@ class BurnTab(Tab):
 
     def _do_burn(self, video_path: Path, srt_path: Path,
                  sp: dict, bp: dict, with_banner: bool,
-                 out_path: Path, encoder: str, quality_params: dict = None):
+                 out_path: Path, encoder: str, quality_params: dict = None,
+                 clip_ranges: list = None):
         import time as _time
         import shutil
         import subprocess
@@ -2671,7 +2432,8 @@ class BurnTab(Tab):
         from fractions import Fraction
 
         if quality_params is None:
-            quality_params = {"scale": (1920, 1080), "vbitrate": 8000}
+            quality_params = {"scale": (1920, 1080), "vbitrate": 8000, "fps_cap": None}
+        clip_ranges = clip_ranges or []   # [(start_s, end_s), ...]；空=全程
 
         def log(msg: str):
             self.app.after(0, lambda m=msg: self._burn_log(m))
@@ -2715,25 +2477,79 @@ class BurnTab(Tab):
                 out_w, out_h = src_w, src_h
             vbitrate = quality_params.get("vbitrate", 8000)
 
-            if encoder != "libx264" and not _verify_av_encoder(
-                    encoder, fps_rate, out_w, out_h, vbitrate):
-                encoder = "libx264"
-                self.app.after(0, lambda: self._encoder_lbl.configure(
-                    text="编码器: 软件编码 (libx264，已自动回退)"))
+            # 输出帧率：源帧率封顶到 fps_cap（仅在源更高时才降，避免给低帧率源插帧）。
+            # out_fps=None 表示保持源帧率，下游不插入 fps 滤镜。
+            fps_cap = quality_params.get("fps_cap")
+            if fps_cap and fps > fps_cap + 0.01:
+                out_fps      = float(fps_cap)
+                out_fps_rate = Fraction(fps_cap)
+                log(f"帧率封顶：源 {fps:.2f}fps → 输出 {out_fps:.0f}fps（减少编码量）")
+            else:
+                out_fps      = fps
+                out_fps_rate = fps_rate
+
+            if encoder != "libx264":
+                # 圆角/直角路径都由系统 ffmpeg.exe 实际编码，故优先用 CLI 校验；
+                # 仅无 ffmpeg（PyAV 兜底编码）时才用 PyAV 校验。两者均按真实
+                # 输出尺寸进行，避免硬件编码器(AMD AMF 等)因尺寸过小被误判回退。
+                _ff = shutil.which("ffmpeg")
+                if _ff:
+                    _enc_ok = _verify_encoder_cli(_ff, encoder, out_w, out_h)
+                else:
+                    _enc_ok = _verify_av_encoder(encoder, fps_rate, out_w, out_h, vbitrate)
+                if not _enc_ok:
+                    encoder = "libx264"
+                    self.app.after(0, lambda: self._encoder_lbl.configure(
+                        text="编码器: 软件编码 (libx264，已自动回退)"))
 
             log(f"开始烧录: 编码器={encoder}, 分辨率={out_w}×{out_h}, "
                 f"码率={vbitrate} kbps, 共 {total_frames} 帧"
                 + (f", 音频={audio_codec_name}" if audio_codec_name else ""))
 
+            # 供完成时展示：原始/输出分辨率、帧率、时长（裁剪时输出时长为保留总和）
+            _in_dur  = (total_frames / fps) if fps else 0
+            _out_dur = (sum(b - a for a, b in clip_ranges) if clip_ranges
+                        else _in_dur)
+            self._burn_metrics = {
+                "encoder": encoder, "fps": fps, "out_fps": out_fps,
+                "src_w": src_w, "src_h": src_h,
+                "out_w": out_w, "out_h": out_h,
+                "in_dur": _in_dur, "out_dur": _out_dur,
+            }
+
+            # ffmpeg 的 -progress 报告的是「输出」帧数（已按 out_fps 降帧），
+            # 故进度分母也要用输出帧数，否则降帧后进度条永远到不了头。
+            out_total_frames = total_frames
+            if out_fps != fps and _in_dur > 0:
+                out_total_frames = max(1, int(round(_in_dur * out_fps)))
+
             stop             = self._burn_stop
             round_corners    = getattr(self, "_burn_round_corners",
                                        tk.BooleanVar(value=True)).get()
             ffmpeg_exe       = shutil.which("ffmpeg")
+
+            if clip_ranges:
+                # 时间片段裁剪仅在「圆角字幕轨 + ffmpeg overlay」路径实现：
+                # 它的字幕是与原视频逐帧对齐的独立图层，裁剪时按相同区间裁视频与
+                # 字幕轨即可天然同步，无需重算 SRT 时间码。直角 ass 路径与无 ffmpeg
+                # 的 PIL 兜底都不支持裁剪，故此处强制走 overlay 路径。
+                if not ffmpeg_exe:
+                    log("❌ 时间片段裁剪需要 ffmpeg，请安装后重试")
+                    self.app.after(0, lambda: self._on_burn_done(
+                        False, "时间片段裁剪需要 ffmpeg"))
+                    return
+                _kept = sum(b - a for a, b in clip_ranges)
+                log(f"时间片段：{len(clip_ranges)} 段，保留约 {_kept:.1f}s"
+                    + ("（已忽略直角设置，裁剪仅支持圆角路径）" if not round_corners else ""))
+
             # ── 快速路径: ffmpeg + libass（直角，约100-200 fps）─────────────────
-            if ffmpeg_exe and not round_corners:
+            if ffmpeg_exe and not round_corners and not clip_ranges:
                 ass_path = _write_ass(subs, sp, out_w, out_h)
                 try:
                     filter_parts: list = []
+                    # fps 滤镜放最前：先把帧率降到目标，scale/ass/编码都按低帧率跑
+                    if out_fps != fps:
+                        filter_parts.append(f"fps={out_fps:g}")
                     if out_w != src_w or out_h != src_h:
                         filter_parts.append(f"scale={out_w}:{out_h}")
 
@@ -2879,11 +2695,11 @@ class BurnTab(Tab):
                                     fps_val = float(v)
                                 except ValueError:
                                     pass
-                            elif k == "progress" and frame_n > 0 and total_frames > 0:
-                                pct   = min(98.0, frame_n / total_frames * 100)
-                                eta_s = ((total_frames - frame_n) / fps_val
+                            elif k == "progress" and frame_n > 0 and out_total_frames > 0:
+                                pct   = min(98.0, frame_n / out_total_frames * 100)
+                                eta_s = ((out_total_frames - frame_n) / fps_val
                                          if fps_val > 0 else 0)
-                                log(f"  {frame_n}/{total_frames} 帧  "
+                                log(f"  {frame_n}/{out_total_frames} 帧  "
                                     f"{fps_val:.1f} fps  "
                                     f"剩余 {int(eta_s // 60)}:{int(eta_s % 60):02d}")
                                 self.app.after(0, lambda p=pct, e=eta_s: self._set_progress(p, e, 1, 1, "FFmpeg 编码"))
@@ -3097,27 +2913,82 @@ class BurnTab(Tab):
                                 sub_out.mux(pkt)
 
                     if stop.is_set():
+                        # 字幕轨阶段被停止：必须走正常收尾，否则按钮卡在
+                        # "正在停止…"、_is_running 一直为 True、无法再次开始。
+                        log("已停止烧录")
+                        self.app.after(0, lambda: self._on_burn_done(False, "已停止烧录"))
                         return
 
                     _enc_s = _time.time() - t_encode_start
                     log(f"字幕轨完成（{n_segs} 段，耗时 {_enc_s:.1f}s），开始 FFmpeg overlay 合并…")
                     self.app.after(0, lambda: self._set_progress(50.0, None, 2, 2, "FFmpeg 合并"))
 
+                    # 基础 overlay：把字幕轨叠回（必要时先缩放）原视频。
+                    # 全程烧录时直接输出 [vout]；裁剪时先输出中间标签 [ov]，
+                    # 再交给下方 trim/concat 处理。
+                    _ov = "ov" if clip_ranges else "vout"
+                    # [0:v] 先降帧率再缩放，使 overlay/编码都按目标帧率进行
+                    _v_pre: list = []
+                    if out_fps != fps:
+                        _v_pre.append(f"fps={out_fps:g}")
                     if out_w != src_w or out_h != src_h:
-                        filter_complex = (f"[0:v]scale={out_w}:{out_h}[base];"
-                                          f"[base][1:v]overlay=0:0[vout]")
+                        _v_pre.append(f"scale={out_w}:{out_h}")
+                    if _v_pre:
+                        base_fc = (f"[0:v]{','.join(_v_pre)}[base];"
+                                   f"[base][1:v]overlay=0:0[{_ov}]")
                     else:
-                        filter_complex = "[0:v][1:v]overlay=0:0[vout]"
+                        base_fc = f"[0:v][1:v]overlay=0:0[{_ov}]"
 
                     _MP4_INCOMPAT_AUDIO = {"opus", "vorbis", "flac", "wavpack"}
                     out_ext = Path(str(out_path)).suffix.lower().lstrip(".")
-                    if not has_audio:
-                        audio_opts = ["-an"]
-                    elif out_ext in ("mp4", "m4v") and audio_codec_name in _MP4_INCOMPAT_AUDIO:
-                        audio_opts = ["-map", "0:a:0", "-c:a", "aac", "-q:a", "2"]
-                        log(f"音频转码: {audio_codec_name} → AAC")
+
+                    if clip_ranges:
+                        # 多片段裁剪：视频与音频按相同区间 trim 后 concat 拼接。
+                        # 字幕轨已与原视频逐帧对齐，故裁剪含字幕的 [ov] 即天然同步，
+                        # 无需重算 SRT。concat 作用于解码帧，音频无法 copy，
+                        # 必须重编码为 AAC。
+                        n = len(clip_ranges)
+                        parts = [base_fc]
+                        if n == 1:
+                            a, b = clip_ranges[0]
+                            parts.append(f"[ov]trim={a:.3f}:{b:.3f},"
+                                         f"setpts=PTS-STARTPTS[vout]")
+                        else:
+                            parts.append("[ov]split=" + str(n)
+                                         + "".join(f"[s{i}]" for i in range(n)))
+                            for i, (a, b) in enumerate(clip_ranges):
+                                parts.append(f"[s{i}]trim={a:.3f}:{b:.3f},"
+                                             f"setpts=PTS-STARTPTS[t{i}]")
+                            parts.append("".join(f"[t{i}]" for i in range(n))
+                                         + f"concat=n={n}:v=1:a=0[vout]")
+
+                        if has_audio:
+                            if n == 1:
+                                a, b = clip_ranges[0]
+                                parts.append(f"[0:a]atrim={a:.3f}:{b:.3f},"
+                                             f"asetpts=PTS-STARTPTS[aout]")
+                            else:
+                                parts.append("[0:a]asplit=" + str(n)
+                                             + "".join(f"[as{i}]" for i in range(n)))
+                                for i, (a, b) in enumerate(clip_ranges):
+                                    parts.append(f"[as{i}]atrim={a:.3f}:{b:.3f},"
+                                                 f"asetpts=PTS-STARTPTS[u{i}]")
+                                parts.append("".join(f"[u{i}]" for i in range(n))
+                                             + f"concat=n={n}:v=0:a=1[aout]")
+                            audio_opts = ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"]
+                        else:
+                            audio_opts = ["-an"]
+
+                        filter_complex = ";".join(parts)
                     else:
-                        audio_opts = ["-map", "0:a?", "-c:a", "copy"]
+                        filter_complex = base_fc
+                        if not has_audio:
+                            audio_opts = ["-an"]
+                        elif out_ext in ("mp4", "m4v") and audio_codec_name in _MP4_INCOMPAT_AUDIO:
+                            audio_opts = ["-map", "0:a:0", "-c:a", "aac", "-q:a", "2"]
+                            log(f"音频转码: {audio_codec_name} → AAC")
+                        else:
+                            audio_opts = ["-map", "0:a?", "-c:a", "copy"]
 
                     enc_opts_ov: list = []
                     if encoder == "h264_nvenc":
@@ -3157,6 +3028,12 @@ class BurnTab(Tab):
                     _stderr_t2 = threading.Thread(target=_read_stderr2, daemon=True)
                     _stderr_t2.start()
 
+                    # 裁剪后输出帧数 ≈ 保留总时长 × fps，进度分母据此调整，
+                    # 否则用原视频总帧数会让进度条永远到不了 98%。
+                    prog_total = out_total_frames
+                    if clip_ranges and out_fps > 0:
+                        prog_total = max(1, int(sum(b - a for a, b in clip_ranges) * out_fps))
+
                     frame_n2 = 0
                     fps_val2 = 0.0
                     for line in proc2.stdout:
@@ -3170,11 +3047,11 @@ class BurnTab(Tab):
                         elif k == "fps":
                             try: fps_val2 = float(v)
                             except ValueError: pass
-                        elif k == "progress" and frame_n2 > 0 and total_frames > 0:
-                            pct   = min(98.0, 50.0 + frame_n2 / total_frames * 48)
-                            eta_s = ((total_frames - frame_n2) / fps_val2
+                        elif k == "progress" and frame_n2 > 0 and prog_total > 0:
+                            pct   = min(98.0, 50.0 + frame_n2 / prog_total * 48)
+                            eta_s = ((prog_total - frame_n2) / fps_val2
                                      if fps_val2 > 0 else 0)
-                            log(f"  {frame_n2}/{total_frames} 帧  "
+                            log(f"  {frame_n2}/{prog_total} 帧  "
                                 f"{fps_val2:.1f} fps  "
                                 f"剩余 {int(eta_s // 60)}:{int(eta_s % 60):02d}")
                             self.app.after(0, lambda p=pct, e=eta_s: self._set_progress(p, e, 2, 2, "FFmpeg 合并"))
@@ -3230,8 +3107,9 @@ class BurnTab(Tab):
                     fps_count   = 0
                     t_last_log  = _time.time()
 
+                    _next_out_idx = 0
                     with av.open(tmp_vid, "w") as out_c:
-                        out_s          = out_c.add_stream(encoder, rate=fps_rate)
+                        out_s          = out_c.add_stream(encoder, rate=out_fps_rate)
                         out_s.width    = out_w
                         out_s.height   = out_h
                         out_s.pix_fmt  = "yuv420p"
@@ -3244,6 +3122,12 @@ class BurnTab(Tab):
                                     break
                                 pts_s    = (float(raw_frame.pts * raw_frame.time_base)
                                             if raw_frame.pts is not None else 0.0)
+                                # 降帧：每个输出时隙只保留首帧，其余源帧直接丢弃
+                                if out_fps != fps:
+                                    _oi = int(pts_s * out_fps + 1e-6)
+                                    if _oi < _next_out_idx:
+                                        continue
+                                    _next_out_idx = _oi + 1
                                 sub_text = find_sub_pil(pts_s)
                                 needs_pil = bool(sub_text.strip()) or banner_patch is not None
                                 if needs_pil:
@@ -3269,11 +3153,11 @@ class BurnTab(Tab):
                                     render_fps = fps_count / (now - t_last_log)
                                     fps_count  = 0
                                     t_last_log = now
-                                    if total_frames > 0:
-                                        pct   = min(95.0, frame_count / total_frames * 100)
-                                        eta_s = ((total_frames - frame_count) / render_fps
+                                    if out_total_frames > 0:
+                                        pct   = min(95.0, frame_count / out_total_frames * 100)
+                                        eta_s = ((out_total_frames - frame_count) / render_fps
                                                  if render_fps > 0 else 0)
-                                        log(f"  {frame_count}/{total_frames} 帧  "
+                                        log(f"  {frame_count}/{out_total_frames} 帧  "
                                             f"{render_fps:.1f} fps  "
                                             f"剩余 {int(eta_s // 60)}:{int(eta_s % 60):02d}")
                                         _tp = 2 if has_audio else 1
@@ -3340,15 +3224,19 @@ class BurnTab(Tab):
             parts.append(phase_name)
         prefix = ": ".join(parts) if parts else ""
 
+        elapsed = (_time.time() - self._burn_start_time) if self._burn_start_time else 0
+        em, es = int(elapsed // 60), int(elapsed % 60)
+        used_str = f"已用 {em}:{es:02d}"
+
         if value > 0.5 and eta_s is not None:
             m, s = int(eta_s // 60), int(eta_s % 60)
-            eta_str = f"剩余 {m}:{s:02d}"
-            text = f"{prefix}  {eta_str}" if prefix else f"{value:.1f}%  {eta_str}"
+            tail = f"{used_str} · 剩余 {m}:{s:02d}"
+            text = f"{prefix}  {tail}" if prefix else f"{value:.1f}%  {tail}"
         elif prefix:
-            text = prefix
+            text = f"{prefix}  {used_str}"
         else:
-            text = f"{value:.1f}%"
-        self._burn_prog_label.configure(text=text)
+            text = f"{value:.1f}%  {used_str}"
+        self._burn_prog_label.configure(text=text, fg=HL_GREEN)
 
     def _on_burn_done(self, success: bool, msg: str):
         import time as _time
@@ -3360,9 +3248,37 @@ class BurnTab(Tab):
             bg="#1e3a4a", fg="#aaccdd", activebackground="#2a5a6a")
         if success:
             self._progress["value"] = 100
+
+            def _fmt(sec):
+                sec = int(round(sec))
+                h, m, s = sec // 3600, (sec % 3600) // 60, sec % 60
+                return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
             em, es = int(elapsed // 60), int(elapsed % 60)
-            self._burn_prog_label.configure(text=f"完成  总用时 {em}:{es:02d}")
-            messagebox.showinfo("完成", f"烧录完成！\n输出文件：\n{msg}")
+            mt = getattr(self, "_burn_metrics", None)
+            if mt:
+                fps = mt["fps"]
+                out_fps = mt.get("out_fps", fps)
+                speed = (mt["out_dur"] / elapsed) if elapsed > 0 else 0
+                # 降帧时标注「源→输出」帧率，让人一眼看出帧率确实降了
+                fps_txt = (f"{out_fps:.0f}fps" if abs(out_fps - fps) < 0.01
+                           else f"{fps:.0f}→{out_fps:.0f}fps")
+                # 完整明细直接写在进度条上方，不再弹窗
+                detail = (
+                    f"✅ 烧录完成！\n"
+                    f"视频时长 {_fmt(mt['out_dur'])}　总耗时 {em}:{es:02d}"
+                    f"（{speed:.1f}× 实时）\n"
+                    f"原始 {mt['src_w']}×{mt['src_h']} → "
+                    f"输出 {mt['out_w']}×{mt['out_h']} @ {fps_txt}"
+                    f"　编码器 {mt['encoder']}\n"
+                    f"输出文件：{msg}"
+                )
+            else:
+                detail = (f"✅ 烧录完成！  总耗时 {em}:{es:02d}\n"
+                          f"输出文件：{msg}")
+            self._burn_prog_label.configure(text=detail, fg=HL_GREEN)
+            # 完成后自动打开输出视频所在文件夹，方便后续操作
+            self._open_output_folder(msg)
         elif msg == "已停止烧录":
             self._progress["value"] = 0
             self._burn_prog_label.configure(text="")
@@ -3373,25 +3289,23 @@ class BurnTab(Tab):
             summary = msg.split("\n")[0]
             messagebox.showerror("烧录失败", f"{summary}\n\n详细错误请查看下方日志框。")
 
+    def _open_output_folder(self, out_path: str):
+        """烧录成功后在资源管理器中打开输出文件夹并选中视频文件。"""
+        try:
+            path = os.path.abspath(out_path)
+            if os.path.exists(path):
+                # /select 让资源管理器打开文件夹并高亮选中刚烧好的视频
+                import subprocess
+                subprocess.Popen(["explorer", "/select,", path])
+            else:
+                folder = os.path.dirname(path)
+                if os.path.isdir(folder):
+                    os.startfile(folder)
+        except Exception as e:
+            self._burn_log(f"打开输出文件夹失败：{e}")
+
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
-
-def _td_to_str(td) -> str:
-    total = int(td.total_seconds() * 1000)
-    ms = total % 1000
-    s  = (total // 1000) % 60
-    m  = (total // 60000) % 60
-    h  = total // 3600000
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def _ms_to_hms(ms: int) -> str:
-    ms = max(0, int(ms))
-    s  = (ms // 1000) % 60
-    m  = (ms // 60000) % 60
-    h  = ms // 3600000
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
 
 def _set_sash(paned: tk.PanedWindow, ratio: float):
     try:

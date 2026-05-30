@@ -3,6 +3,9 @@ from tkinter import ttk
 
 BG = "#1e1e1e"
 
+# 关键信息高亮色（亮绿，深色背景上醒目）——就绪/完成/进度/状态等重要文字统一用它
+HL_GREEN = "#3dff85"
+
 
 class Tab:
     """Base class for all tabs."""

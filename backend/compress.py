@@ -103,7 +103,7 @@ def compress_video(config, log, progress_cb, stop_event=None):
 
     config 字段:
       input_path, output_path, encoder, vbitrate (kbps),
-      abitrate (kbps), scale ((w,h) 或 None), duration (秒)
+      abitrate (kbps), scale ((w,h) 或 None), fps (输出帧率上限或 None), duration (秒)
 
     progress_cb(pct: float) 传入 0–100
     返回 output_path（成功）或 None（失败/取消）
@@ -122,15 +122,18 @@ def compress_video(config, log, progress_cb, stop_event=None):
     vbitrate    = int(config['vbitrate'])
     abitrate    = int(config['abitrate'])
     scale       = config.get('scale')        # (w, h) or None
+    out_fps     = config.get('fps')           # 输出帧率上限，None=随源
     duration    = float(config.get('duration', 0))
 
-    # ── 构造缩放滤镜 ──────────────────────────────────────────────────────────
+    # ── 构造视频滤镜（fps 放最前，缩放/编码都按降后帧率跑）────────────────────
+    vf_parts = []
+    if out_fps:
+        vf_parts.append(f"fps={out_fps:g}")
     if scale:
         w, h = scale
-        vf = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-              f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black")
-    else:
-        vf = None
+        vf_parts.append(f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black")
+    vf = ",".join(vf_parts) if vf_parts else None
 
     # ── 构造 FFmpeg 命令 ──────────────────────────────────────────────────────
     cmd = [ffmpeg, '-y', '-i', input_path]
@@ -163,6 +166,8 @@ def compress_video(config, log, progress_cb, stop_event=None):
     log(f"   编码器: {encoder}  |  视频: {vbitrate} kbps  |  音频: {abitrate} kbps")
     if scale:
         log(f"   目标分辨率: {scale[0]}×{scale[1]}")
+    if out_fps:
+        log(f"   帧率封顶: {out_fps:g} fps（源更高，已降帧以减少编码量）")
     log(f"   输出: {output_path}")
 
     # ── 执行并解析进度 ────────────────────────────────────────────────────────

@@ -15,7 +15,7 @@ except ImportError:
     HAS_DND = False
 
 from backend import detect_hw_encoder, compress_probe, compress_video, estimate_output_size
-from .base import Tab, BG
+from .base import Tab, BG, HL_GREEN
 
 
 class CompressTab(Tab):
@@ -77,10 +77,10 @@ class CompressTab(Tab):
         self._cmp_preset_var = tk.StringVar(value="balanced")
 
         _presets = [
-            ("fast",     "🚀 极速上传",  "720p · 2.5 Mbps · 文件最小"),
-            ("balanced", "⚖️ 均衡模式",  "1080p · 8 Mbps · 推荐"),
-            ("quality",  "💎 最高画质",  "原始分辨率 · 15 Mbps"),
-            ("custom",   "🔧 自定义",    "手动设置分辨率 / 码率"),
+            ("fast",     "🚀 极速上传",  "720p · 30fps · 2.5 Mbps · 文件最小"),
+            ("balanced", "⚖️ 均衡模式",  "1080p · 30fps · 8 Mbps · 推荐"),
+            ("quality",  "💎 最高画质",  "原始分辨率 · 原始帧率 · 15 Mbps"),
+            ("custom",   "🔧 自定义",    "手动设置分辨率 / 码率（帧率随源）"),
         ]
         for i, (key, label, desc) in enumerate(_presets):
             row_bg = "#252525"
@@ -217,6 +217,8 @@ class CompressTab(Tab):
             relief="flat", font=("Consolas", 9), state="disabled", wrap="word",
         )
         self._cmp_log_box.grid(row=9, column=0, sticky="nsew", padx=16, pady=(0, 12))
+        # 关键行（完成/✅）高亮成亮绿
+        self._cmp_log_box.tag_configure("hl", foreground=HL_GREEN)
 
         # 初始化状态，后台检测编码器
         self._detect_cmp_encoder()
@@ -229,7 +231,8 @@ class CompressTab(Tab):
             while True:
                 msg = self._cmp_log_queue.get_nowait()
                 self._cmp_log_box.configure(state="normal")
-                self._cmp_log_box.insert("end", msg + "\n")
+                is_hl = ("✅" in msg or "完成" in msg)
+                self._cmp_log_box.insert("end", msg + "\n", ("hl",) if is_hl else ())
                 self._cmp_log_box.see("end")
                 self._cmp_log_box.configure(state="disabled")
         except queue.Empty:
@@ -394,10 +397,12 @@ class CompressTab(Tab):
 
         # 构造压缩参数
         preset = self._cmp_preset_var.get()
+        # fps_cap：输出帧率上限（None=随源）。极速/均衡封顶 30fps，把 60fps 源的
+        # 编码量砍半；最高画质/自定义保持源帧率。与 burn tab 同一套策略。
         _preset_map = {
-            "fast":     {"scale": (1280, 720),  "vbitrate": 2500,  "abitrate": 128},
-            "balanced": {"scale": (1920, 1080), "vbitrate": 8000,  "abitrate": 192},
-            "quality":  {"scale": None,          "vbitrate": 15000, "abitrate": 320},
+            "fast":     {"scale": (1280, 720),  "vbitrate": 2500,  "abitrate": 128, "fps_cap": 30},
+            "balanced": {"scale": (1920, 1080), "vbitrate": 8000,  "abitrate": 192, "fps_cap": 30},
+            "quality":  {"scale": None,          "vbitrate": 15000, "abitrate": 320, "fps_cap": None},
         }
         if preset == "custom":
             try:
@@ -417,13 +422,19 @@ class CompressTab(Tab):
                     scale = (int(w), int(h))
                 except Exception:
                     scale = None
-            params = {"scale": scale, "vbitrate": vbr, "abitrate": abr}
+            params = {"scale": scale, "vbitrate": vbr, "abitrate": abr, "fps_cap": None}
         else:
             params = _preset_map.get(preset, _preset_map["balanced"])
 
         probe    = self._cmp_probe_info
         duration = probe['duration'] if probe else 0
         encoder  = self._cmp_encoder or 'libx264'
+
+        # 输出帧率：源帧率封顶到 fps_cap（仅在源更高时才降，不给低帧率源插帧）。
+        # 拿不到源帧率时保守不降（fps=None）。
+        src_fps = (probe or {}).get('fps')
+        fps_cap = params.get("fps_cap")
+        out_fps = fps_cap if (fps_cap and src_fps and src_fps > fps_cap + 0.01) else None
 
         config = {
             "input_path":  input_path,
@@ -432,6 +443,7 @@ class CompressTab(Tab):
             "vbitrate":    params["vbitrate"],
             "abitrate":    params["abitrate"],
             "scale":       params["scale"],
+            "fps":         out_fps,
             "duration":    duration,
         }
 
@@ -457,7 +469,7 @@ class CompressTab(Tab):
                 self._cmp_cancel_btn.configure(state="disabled", fg="#888888")
                 if result:
                     self._cmp_progress["value"] = 100
-                    self._cmp_prog_label.configure(text="✅ 完成")
+                    self._cmp_prog_label.configure(text="✅ 完成", fg=HL_GREEN)
                     try:
                         os.startfile(os.path.dirname(os.path.abspath(result)))
                     except Exception:
@@ -476,9 +488,9 @@ class CompressTab(Tab):
             elapsed = _time.time() - self._cmp_start_time
             eta     = elapsed / pct * (100 - pct)
             m, s    = int(eta // 60), int(eta % 60)
-            self._cmp_prog_label.configure(text=f"{pct:.1f}%  剩余 {m}:{s:02d}")
+            self._cmp_prog_label.configure(text=f"{pct:.1f}%  剩余 {m}:{s:02d}", fg="#888888")
         else:
-            self._cmp_prog_label.configure(text=f"{pct:.1f}%")
+            self._cmp_prog_label.configure(text=f"{pct:.1f}%", fg="#888888")
 
     def _cancel_compress(self):
         if self._cmp_stop_event:
