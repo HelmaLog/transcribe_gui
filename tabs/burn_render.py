@@ -349,9 +349,15 @@ def _make_banner_patch(bp: dict, frame_w: int, frame_h: int):
     position = bp.get("position", "top")
     align    = bp.get("align", "center")
     tc_rgb   = _hex_to_rgb(bp.get("text_color", "#ffffff"))
+    no_bg    = bool(bp.get("no_bg", False))
+    border_w = int(bp.get("border_w", 0)) if bp.get("border", False) else 0
+    bd_rgb   = _hex_to_rgb(bp.get("border_color", "#000000"))
 
-    patch = Image.new("RGBA", (frame_w, height),
-                      _hex_to_rgb(bp.get("bg_color", "#1a1a2e")) + (255,))
+    if no_bg:
+        patch = Image.new("RGBA", (frame_w, height), (0, 0, 0, 0))
+    else:
+        patch = Image.new("RGBA", (frame_w, height),
+                          _hex_to_rgb(bp.get("bg_color", "#1a1a2e")) + (255,))
     draw  = ImageDraw.Draw(patch)
 
     # y_top_offset: gap between PIL draw origin and actual visible glyph top
@@ -379,20 +385,25 @@ def _make_banner_patch(bp: dict, frame_w: int, frame_h: int):
     # Visually center: account for y_top_offset so top/bottom gap are equal
     ty = (height - th) // 2 - _y_top_offset + bp.get("voffset", 0)
     if align == "left":
-        tx = 16
+        tx = 16 + border_w          # 给左侧描边留出空间
     elif align == "right":
-        tx = frame_w - tw - 16
+        tx = frame_w - tw - 16 - border_w
     else:
-        tx = (frame_w - tw) // 2
+        tx = (frame_w - tw) // 2    # 居中时描边对称外扩，无需补偿
+
+    _stroke = {}
+    if border_w > 0:
+        _stroke = dict(stroke_width=border_w, stroke_fill=bd_rgb + (255,))
 
     if _pilmoji_src:
         try:
             with Pilmoji(patch, source=_pilmoji_src) as pm:
-                pm.text((tx, ty), text, fill=tc_rgb + (255,), font=font)
+                pm.text((tx, ty), text, fill=tc_rgb + (255,), font=font, **_stroke)
         except Exception:
-            draw.text((tx, ty + _y_top_offset), text, fill=tc_rgb + (255,), font=font)
+            draw.text((tx, ty + _y_top_offset), text, fill=tc_rgb + (255,),
+                      font=font, **_stroke)
     else:
-        draw.text((tx, ty), text, fill=tc_rgb + (255,), font=font)
+        draw.text((tx, ty), text, fill=tc_rgb + (255,), font=font, **_stroke)
 
     py = 0 if position == "top" else frame_h - height
     return patch, (0, py)
@@ -419,7 +430,7 @@ def render_banner_on_frame(img: "Image.Image", bp: dict) -> "Image.Image":
     img = img.convert("RGBA")
     patch, pos = _make_banner_patch(bp, img.width, img.height)
     if patch is not None:
-        img.paste(patch, pos)
+        img.paste(patch, pos, patch)   # 用 alpha 作 mask，支持透明背景
     return img.convert("RGB")
 
 
@@ -517,6 +528,9 @@ def _banner_filter(bp: dict, out_w: int, out_h: int) -> str:
     font_sz  = bp.get("font_size", 32)
     tc_hex   = bp.get("text_color", "#ffffff").lstrip("#")
     bc_hex   = bp.get("bg_color",  "#1a1a2e").lstrip("#")
+    no_bg    = bool(bp.get("no_bg", False))
+    border_w = int(bp.get("border_w", 0)) if bp.get("border", False) else 0
+    bd_hex   = bp.get("border_color", "#000000").lstrip("#")
 
     box_y  = "0"        if position == "top" else f"ih-{height}"
     text_y = (f"({height}-text_h)/2"
@@ -538,7 +552,9 @@ def _banner_filter(bp: dict, out_w: int, out_h: int) -> str:
              f":color=0x{bc_hex}ff@1.0:t=fill")
     dtext = (f"drawtext=text='{t}':fontsize={font_sz}{font_arg}"
              f":fontcolor=0x{tc_hex}:x={text_x}:y={text_y}")
-    return f"{box},{dtext}"
+    if border_w > 0:
+        dtext += f":borderw={border_w}:bordercolor=0x{bd_hex}"
+    return dtext if no_bg else f"{box},{dtext}"
 
 
 # ── Time-format helpers ────────────────────────────────────────────────────────

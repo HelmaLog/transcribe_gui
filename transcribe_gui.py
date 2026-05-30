@@ -63,6 +63,13 @@ class App(_TkBase):
     def __init__(self):
         super().__init__()
         self.title("字幕生成 & 双语翻译")
+        # 窗口图标：与快捷方式一致用 app.ico（任务栏运行时图标）
+        try:
+            _ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.ico")
+            if os.path.exists(_ico):
+                self.iconbitmap(default=_ico)
+        except Exception:
+            pass
         self.resizable(True, True)
         self.configure(bg=BG)
         self.minsize(600, 550)
@@ -144,7 +151,8 @@ class App(_TkBase):
             self._nb.add(frame, text=text)
             self.tabs.append(TabClass(self, frame))
 
-        self.download_tab, self.transcribe_tab, self.burn_tab, self.tweet_tab, self.compress_tab = self.tabs
+        (self.download_tab, self.transcribe_tab, self.burn_tab,
+         self.tweet_tab, self.compress_tab) = self.tabs
 
     # ── Shared helpers ────────────────────────────────────────────────────────
     def get_api_key(self, provider: str):
@@ -175,5 +183,14 @@ class App(_TkBase):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # 必须在创建窗口前设置 AppUserModelID，否则 Windows 任务栏会把进程归到
+    # python/pyw 解释器名下、显示解释器图标，而不是我们的 app.ico。
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "QinQin.TranscribeGUI")
+        except Exception:
+            pass
     app = App()
     app.mainloop()

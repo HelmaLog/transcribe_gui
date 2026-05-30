@@ -6,10 +6,11 @@ import os
 import re
 import queue
 import threading
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 
-from backend import query_video_info, run_download
+from backend import query_video_info, run_download, chat_log
 from .base import Tab, BG, HL_GREEN
 
 
@@ -279,6 +280,12 @@ class DownloadTab(Tab):
             bg="#3a3a3a", fg="#cccccc", relief="flat",
             font=("Segoe UI", 10), padx=20, pady=7,
             cursor="hand2", activebackground="#4a4a4a").pack(side="left", padx=(10, 0))
+        self._chat_btn = tk.Button(
+            f_btn, text="💬 Claudecode 聊天内容", command=self._open_chat_history,
+            bg="#3a3a3a", fg="#cccccc", relief="flat",
+            font=("Segoe UI", 10), padx=20, pady=7,
+            cursor="hand2", activebackground="#4a4a4a")
+        self._chat_btn.pack(side="left", padx=(10, 0))
 
         # ── Progress bar row ──────────────────────────────────────────────────
         prog_f = tk.Frame(p, bg=BG)
@@ -358,6 +365,27 @@ class DownloadTab(Tab):
             os.startfile(folder)
         else:
             self._dl_log(f"❌ 文件夹不存在: {folder}")
+
+    # ── Claude Code 聊天记录（浏览器查看）─────────────────────────────────────
+    def _open_chat_history(self):
+        """解析会话日志生成网页并在浏览器打开（耗时操作放后台线程）。"""
+        self._chat_btn.configure(state="disabled", text="⏳ 生成中…")
+        self._dl_log("💬 正在生成 Claudecode 聊天记录…")
+
+        def work():
+            try:
+                index = chat_log.generate_html()
+                webbrowser.open(index.as_uri())
+                msg = f"✅ 已在浏览器打开聊天记录: {index}"
+            except Exception as e:
+                msg = f"❌ 打开聊天记录失败: {e}"
+            self.app.after(0, lambda: self._chat_done(msg))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _chat_done(self, msg):
+        self._chat_btn.configure(state="normal", text="💬 Claudecode 聊天内容")
+        self._dl_log(msg)
 
     # ── Download flow ─────────────────────────────────────────────────────────
 

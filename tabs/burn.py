@@ -313,7 +313,10 @@ class BurnTab(Tab):
         left.bind("<Configure>", self._on_left_resize)
         self._video_frame.bind("<Configure>", self._on_video_frame_configure)
 
-        p.after(50, lambda: _set_sash(self._paned, self._sash_ratio))
+        # 应用上次保存的分栏比例（决定视频大小）。延迟两次：50ms 抢早，
+        # 300ms 兜底——防止首次窗口几何尚未生效、之后又无 Configure 触发重排。
+        p.after(50,  lambda: _set_sash(self._paned, self._sash_ratio))
+        p.after(300, lambda: _set_sash(self._paned, self._sash_ratio))
 
         if HAS_VLC:
             self._init_vlc()
@@ -346,6 +349,10 @@ class BurnTab(Tab):
         self._banner_pos     = tk.StringVar(value=cfg.get("burn_banner_pos",     "top"))
         self._banner_align   = tk.StringVar(value=cfg.get("burn_banner_align",   "center"))
         self._banner_voffset = tk.IntVar(value=int(cfg.get("burn_banner_voffset", 0)))
+        self._banner_no_bg        = tk.BooleanVar(value=bool(cfg.get("burn_banner_no_bg", False)))
+        self._banner_border       = tk.BooleanVar(value=bool(cfg.get("burn_banner_border", False)))
+        self._banner_border_w     = tk.IntVar(value=int(cfg.get("burn_banner_border_w", 2)))
+        self._banner_border_color = tk.StringVar(value=cfg.get("burn_banner_border_color", "#000000"))
         self._with_banner      = tk.BooleanVar(value=bool(cfg.get("burn_with_banner", False)))
         self._burn_round_corners = tk.BooleanVar(value=bool(cfg.get("burn_round_corners", True)))
         self._burn_preset_var  = tk.StringVar(value=cfg.get("burn_preset", "balanced"))
@@ -359,7 +366,9 @@ class BurnTab(Tab):
                   self._style_bcolor, self._banner_text, self._banner_font,
                   self._banner_size, self._banner_bold, self._banner_tcolor,
                   self._banner_bcolor, self._banner_height, self._banner_pos,
-                  self._banner_align, self._banner_voffset, self._with_banner]:
+                  self._banner_align, self._banner_voffset, self._with_banner,
+                  self._banner_no_bg, self._banner_border,
+                  self._banner_border_w, self._banner_border_color]:
             v.trace_add("write", self._schedule_preview_update)
 
 
@@ -448,13 +457,8 @@ class BurnTab(Tab):
                                   font=("Consolas", 9))
         self._time_lbl.grid(row=0, column=1, padx=(4, 2))
 
-        self._seek_slider = ThinSlider(
-            p, from_=0, to=1000,
-            on_press=self._seek_press_cmd,
-            command=self._seek_drag_cmd,
-            on_release=self._seek_release_cmd,
-        )
-        self._seek_slider.grid(row=0, column=2, sticky="ew", padx=4, pady=5)
+        # 原细进度条已与下方时间条合并，这里用弹性占位把右侧控件推到最右
+        tk.Frame(p, bg="#161616").grid(row=0, column=2, sticky="ew", padx=4)
 
         self._dur_lbl = tk.Label(p, text="00:00:00", bg="#161616", fg="#888888",
                                  font=("Consolas", 9))
@@ -491,26 +495,32 @@ class BurnTab(Tab):
         self._vlc_color_btn.bind("<Button-1>", lambda e: self._pick_vlc_sub_color())
         self._vlc_color_btn.grid(row=0, column=10, padx=(0, 8), pady=4)
 
+        # 统一时间轴（定位 + 片段剪辑）——与上方控制条同一区域，整行铺开
+        self._seg_segbar = SegmentBar(
+            p, on_change=self._on_segbar_change,
+            on_seek=self._on_segbar_seek,
+            on_preview=self._preview_segment,
+            on_pending=self._on_segbar_pending)
+        self._seg_segbar.grid(row=1, column=0, columnspan=11,
+                              sticky="ew", padx=6, pady=(0, 4))
+
     # ── Segments (time-range) ───────────────────────────────────────────────────
 
     def _build_segments(self, p):
         # 列 99 作为弹性占位，把状态标签推到最右
         p.columnconfigure(99, weight=1)
 
-        tk.Label(p, text="✂ 时间片段", bg=BG, fg="#888888",
+        # 选段直接在上方时间轴打点完成：点一下打起点、再点一下打终点。
+        # 这里仅保留提示/清除/状态/片段列表。
+        tk.Label(p, text="✂ 在上方时间轴点击打点选段", bg=BG, fg="#888888",
                  font=("Segoe UI", 8)).grid(row=0, column=0, padx=(2, 6), pady=(2, 2))
 
-        def _mk(text, cmd, col, fg="#cccccc"):
-            b = tk.Button(p, text=text, command=cmd,
-                          bg="#2a2a2a", fg=fg, relief="flat",
-                          font=("Segoe UI", 8), padx=8, pady=1, cursor="hand2",
-                          activebackground="#3a3a3a", activeforeground="#ffffff")
-            b.grid(row=0, column=col, padx=(0, 4), pady=(2, 2))
-            return b
-
-        self._seg_start_btn = _mk("● 标记起点", self._mark_seg_start, 1, fg="#d8a657")
-        self._seg_end_btn   = _mk("■ 标记终点", self._mark_seg_end,   2, fg="#7daea3")
-        self._seg_clear_btn = _mk("清除",       self._clear_segments, 3, fg="#999999")
+        self._seg_clear_btn = tk.Button(
+            p, text="清除", command=self._clear_segments,
+            bg="#2a2a2a", fg="#999999", relief="flat",
+            font=("Segoe UI", 8), padx=8, pady=1, cursor="hand2",
+            activebackground="#3a3a3a", activeforeground="#ffffff")
+        self._seg_clear_btn.grid(row=0, column=1, padx=(0, 4), pady=(2, 2))
 
         self._seg_status = tk.Label(p, text="", bg=BG, fg="#666666",
                                     font=("Segoe UI", 8), anchor="e")
@@ -522,26 +532,37 @@ class BurnTab(Tab):
 
         self._refresh_seg_chips()
 
-    def _current_player_ms(self):
-        """当前播放位置（ms）；无法获取时返回 None。"""
-        if not self._player:
-            return None
-        try:
-            t = self._player.get_time()
-        except Exception:
-            return None
-        if t is None or t < 0:
-            return None
-        return int(t)
+    def _on_segbar_change(self):
+        """时间条上打点/微调/删除后回写：以时间条为准更新片段列表与下方芯片。"""
+        self._segments = list(self._seg_segbar.get_segments())
+        self._stop_seg_loop()
+        self._refresh_seg_chips()
 
-    def _flash_seg_status(self, msg: str):
-        self._seg_status.configure(text=msg, fg="#cc6666")
-        self.app.after(2500, self._update_seg_status)
+    def _on_segbar_pending(self, ms):
+        """时间条上打了起点（待打终点）/取消时的回调，仅用于更新状态文字。"""
+        self._seg_mark_start = ms
+        self._update_seg_status()
+
+    def _on_segbar_seek(self, ms):
+        """时间条上点击空白/拖动边缘时同步跳转视频，便于精细对齐。"""
+        if not self._player or self._duration_ms <= 0:
+            return
+        ms = max(0, min(int(ms), self._duration_ms))
+        try:
+            self._player.set_time(ms)
+        except Exception:
+            pass
+        self._time_lbl.configure(text=_ms_to_hms(ms))
+        # 播放头由时间轴自身绘制，同步它（原独立细进度条已合并，故不再调用 slider）
+        self._seg_segbar.set_position(ms)
+        self._preview_t_sec = None
+        self._preview_gen += 1
+        self._schedule_preview_update()
 
     def _update_seg_status(self):
         if self._seg_mark_start is not None:
             self._seg_status.configure(
-                text=f"起点 {_ms_to_hms(self._seg_mark_start)} → 待标记终点",
+                text=f"起点 {_ms_to_hms(self._seg_mark_start)} → 再点一下打终点",
                 fg="#d8a657")
         elif self._segments:
             total = sum(b - a for a, b in self._segments)
@@ -579,32 +600,9 @@ class BurnTab(Tab):
 
         fr.after_idle(fr._reflow)
         self._update_seg_status()
-
-    def _mark_seg_start(self):
-        t = self._current_player_ms()
-        if t is None:
-            self._flash_seg_status("无法获取当前时间（先加载并播放视频）")
-            return
-        self._seg_mark_start = t
-        self._update_seg_status()
-
-    def _mark_seg_end(self):
-        t = self._current_player_ms()
-        if t is None:
-            self._flash_seg_status("无法获取当前时间")
-            return
-        if self._seg_mark_start is None:
-            self._flash_seg_status("请先标记起点")
-            return
-        a, b = self._seg_mark_start, t
-        if b < a:                      # 容错：终点早于起点则交换
-            a, b = b, a
-        if b - a < 200:
-            self._flash_seg_status("片段太短（<0.2s）")
-            return
-        self._segments.append((a, b))
-        self._seg_mark_start = None
-        self._refresh_seg_chips()
+        # 与控制条时间条保持同步（标记/删除/清除等任何来源的改动都会过这里）
+        if hasattr(self, "_seg_segbar"):
+            self._seg_segbar.set_segments(self._segments)
 
     def _delete_segment(self, start_ms, end_ms):
         try:
@@ -620,6 +618,8 @@ class BurnTab(Tab):
         self._stop_seg_loop()
         self._segments = []
         self._seg_mark_start = None
+        if hasattr(self, "_seg_segbar"):
+            self._seg_segbar.clear_pending()
         if hasattr(self, "_seg_chips"):
             self._refresh_seg_chips()
 
@@ -1087,6 +1087,48 @@ class BurnTab(Tab):
         self._update_color_btn(self._banner_bcolor_btn, self._banner_bcolor.get())
         bflow.add(bbc_c)
 
+        # 去掉背景（透明，仅保留文字）
+        nobg_c = tk.Frame(bflow, bg=BG)
+        tk.Label(nobg_c, text="去掉背景", bg=BG, fg="#888888",
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+        self._banner_nobg_btn = tk.Button(
+            nobg_c, text="关", command=self._toggle_banner_no_bg,
+            bg="#2a2a2a", fg="#888888", relief="flat",
+            font=("Segoe UI", 9), padx=10, pady=1,
+            cursor="hand2", activebackground="#3a3a3a")
+        self._banner_nobg_btn.pack(side="left")
+        bflow.add(nobg_c)
+
+        # 文字描边（开关 + 粗细）
+        bd_c = tk.Frame(bflow, bg=BG)
+        tk.Label(bd_c, text="描边", bg=BG, fg="#888888",
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+        self._banner_border_toggle_btn = tk.Button(
+            bd_c, text="关", command=self._toggle_banner_border,
+            bg="#2a2a2a", fg="#888888", relief="flat",
+            font=("Segoe UI", 9), padx=10, pady=1,
+            cursor="hand2", activebackground="#3a3a3a")
+        self._banner_border_toggle_btn.pack(side="left", padx=(0, 6))
+        tk.Spinbox(bd_c, from_=0, to=20, textvariable=self._banner_border_w,
+                   **_BSP).pack(side="left")
+        bflow.add(bd_c)
+
+        # 描边颜色
+        bdc_c = tk.Frame(bflow, bg=BG)
+        tk.Label(bdc_c, text="描边颜色", bg=BG, fg="#888888",
+                 font=("Segoe UI", 9)).pack(side="left", padx=(0, 4))
+        self._banner_border_btn = tk.Button(
+            bdc_c, text="选择颜色", command=self._pick_banner_border_color,
+            bg="#252525", fg="#cccccc", relief="flat",
+            font=("Segoe UI", 9), padx=8, pady=2,
+            cursor="hand2", activebackground="#3a3a3a")
+        self._banner_border_btn.pack(side="left")
+        self._update_color_btn(self._banner_border_btn, self._banner_border_color.get())
+        bflow.add(bdc_c)
+
+        self._sync_banner_no_bg_btn()
+        self._sync_banner_border_btn()
+
         _bspin("横幅高度", self._banner_height,  10, 400)
         _bspin("纵向微调", self._banner_voffset, -30,  30)
 
@@ -1241,13 +1283,20 @@ class BurnTab(Tab):
                   font=("Segoe UI", 9), cursor="hand2",
                   activebackground="#4a4a4a").grid(row=0, column=2, padx=(6, 0))
 
-        self._burn_btn = tk.Button(p, text="▶  开始烧录", command=self._burn_btn_click,
+        btn_row = tk.Frame(p, bg=BG)
+        btn_row.grid(row=r, column=0, pady=(12, 4))
+        r += 1
+        self._burn_btn = tk.Button(btn_row, text="▶  开始烧录", command=self._burn_btn_click,
                                    bg="#1e3a4a", fg="#aaccdd", relief="flat",
                                    font=("Segoe UI", 11, "bold"), padx=24, pady=8,
                                    cursor="hand2", activebackground="#2a5a6a",
                                    state="disabled")
-        self._burn_btn.grid(row=r, column=0, pady=(12, 4))
-        r += 1
+        self._burn_btn.pack(side="left")
+        tk.Button(btn_row, text="📂 打开目录", command=self._open_burn_dir,
+                  bg="#2a2a2a", fg="#cccccc", relief="flat",
+                  font=("Segoe UI", 10), padx=14, pady=8,
+                  cursor="hand2", activebackground="#3a3a3a",
+                  activeforeground="#ffffff").pack(side="left", padx=(8, 0))
 
         self._encoder_lbl = tk.Label(p, text="编码器: 检测中…",
                                      bg=BG, fg="#444444", font=("Segoe UI", 8))
@@ -1372,6 +1421,39 @@ class BurnTab(Tab):
         if hex_c:
             self._banner_bcolor.set(hex_c)
             self._update_color_btn(self._banner_bcolor_btn, hex_c)
+
+    def _pick_banner_border_color(self):
+        init = self._banner_border_color.get()
+        _, hex_c = colorchooser.askcolor(color=init, title="选择描边颜色")
+        if hex_c:
+            self._banner_border_color.set(hex_c)
+            self._update_color_btn(self._banner_border_btn, hex_c)
+
+    def _toggle_banner_no_bg(self):
+        self._banner_no_bg.set(not self._banner_no_bg.get())
+        self._sync_banner_no_bg_btn()
+
+    def _sync_banner_no_bg_btn(self):
+        on = self._banner_no_bg.get()
+        self._banner_nobg_btn.configure(
+            text="开" if on else "关",
+            bg="#1a3a1a" if on else "#2a2a2a",
+            fg="#5a9a5a" if on else "#888888")
+        # 去背景时背景色按钮失去意义，置灰提示
+        if hasattr(self, "_banner_bcolor_btn"):
+            self._banner_bcolor_btn.configure(
+                state="disabled" if on else "normal")
+
+    def _toggle_banner_border(self):
+        self._banner_border.set(not self._banner_border.get())
+        self._sync_banner_border_btn()
+
+    def _sync_banner_border_btn(self):
+        on = self._banner_border.get()
+        self._banner_border_toggle_btn.configure(
+            text="开" if on else "关",
+            bg="#1a3a1a" if on else "#2a2a2a",
+            fg="#5a9a5a" if on else "#888888")
 
     def _update_color_btn(self, btn: tk.Button, hex_c: str):
         try:
@@ -1576,6 +1658,10 @@ class BurnTab(Tab):
             "position":    self._banner_pos.get(),
             "align":       self._banner_align.get(),
             "voffset":     self._banner_voffset.get(),
+            "no_bg":        self._banner_no_bg.get(),
+            "border":       self._banner_border.get(),
+            "border_w":     self._banner_border_w.get(),
+            "border_color": self._banner_border_color.get(),
         }
 
     # ── Encoder detection ─────────────────────────────────────────────────────
@@ -1663,10 +1749,13 @@ class BurnTab(Tab):
         if d > 0:
             self._duration_ms = d
             self._dur_lbl.configure(text=_ms_to_hms(d))
+            if hasattr(self, "_seg_segbar"):
+                self._seg_segbar.set_duration(self._duration_ms)
         if t >= 0 and not self._dragging_seek:
             self._time_lbl.configure(text=_ms_to_hms(t))
-            if self._duration_ms > 0:
-                self._seek_slider.set(t / self._duration_ms * 1000)
+            # 播放位置改由下方统一时间条显示（set_position）
+            if hasattr(self, "_seg_segbar"):
+                self._seg_segbar.set_position(t)
 
     def _highlight_current_sub(self):
         if not self._subs or getattr(self, "_reloading_subs", False):
@@ -2039,7 +2128,9 @@ class BurnTab(Tab):
             pass
 
         self._player.set_media(media)
-        self._seek_slider.set(0)
+        if hasattr(self, "_seg_segbar"):
+            self._seg_segbar.set_duration(self._duration_ms)
+            self._seg_segbar.set_position(0)
         self._time_lbl.configure(text="00:00:00")
         if self._duration_ms <= 0:
             self._dur_lbl.configure(text="00:00:00")
@@ -2288,7 +2379,18 @@ class BurnTab(Tab):
 
     # ── Config persistence ────────────────────────────────────────────────────
 
+    def _capture_sash_ratio(self):
+        """保存前直接读当前真实 sash 位置，避免依赖可能漏触发的释放回调。"""
+        try:
+            sash_x = self._paned.sash_coord(0)[0]
+            total  = self._paned.winfo_width()
+            if total > 1 and sash_x > 0:
+                self._sash_ratio = max(0.2, min(0.85, sash_x / total))
+        except (tk.TclError, IndexError):
+            pass
+
     def get_config(self):
+        self._capture_sash_ratio()
         return {
             "burn_video_path":    self.video_var.get().strip(),
             "burn_srt_path":      self.srt_var.get().strip(),
@@ -2316,6 +2418,10 @@ class BurnTab(Tab):
             "burn_banner_pos":    self._banner_pos.get(),
             "burn_banner_align":   self._banner_align.get(),
             "burn_banner_voffset": self._banner_voffset.get(),
+            "burn_banner_no_bg":        self._banner_no_bg.get(),
+            "burn_banner_border":       self._banner_border.get(),
+            "burn_banner_border_w":     self._banner_border_w.get(),
+            "burn_banner_border_color": self._banner_border_color.get(),
             "burn_with_banner":    self._with_banner.get(),
             "burn_round_corners":  self._burn_round_corners.get(),
             "burn_preset":       self._burn_preset_var.get(),
@@ -3312,6 +3418,26 @@ class BurnTab(Tab):
         except Exception as e:
             self._burn_log(f"打开输出文件夹失败：{e}")
 
+    def _open_burn_dir(self):
+        """「打开目录」按钮：打开烧录输出所在文件夹。
+        优先打开当前输出路径所在目录（文件已存在则选中它），否则回退到视频所在目录。"""
+        out = self._burn_out_var.get().strip()
+        if out and os.path.exists(out):
+            self._open_output_folder(out)
+            return
+        folder = os.path.dirname(out) if out else ""
+        if not folder or not os.path.isdir(folder):
+            v = self.video_var.get().strip()
+            folder = os.path.dirname(v) if v else ""
+        if folder and os.path.isdir(folder):
+            try:
+                os.startfile(folder)
+            except Exception as e:
+                self._burn_log(f"打开目录失败：{e}")
+        else:
+            messagebox.showinfo("打开目录",
+                                "还没有可打开的输出目录，请先设置输出路径或开始烧录。")
+
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
 
@@ -3451,3 +3577,344 @@ class ThinSlider(tk.Canvas):
     def set(self, value):
         self._value = max(self._from, min(self._to, float(value)))
         self._redraw()
+
+
+# ── Segment timeline (drag-to-clip) ─────────────────────────────────────────────
+
+class SegmentBar(tk.Canvas):
+    """时间条打点剪辑控件：在视频时间轴上点击打点、成对成段。
+
+    交互（成对打点）：
+      · 鼠标悬停          → 跟随光标显示精确时间（毫秒，已知 fps 时附帧号）
+      · 空白处单击        → 第一下打起点，第二下打终点 → 形成一个保留片段
+      · 空白处横向拖动    → 拖动播放头精细定位（scrub，不建段）
+      · 拖片段左/右边缘   → 精细调整起点/终点（同步 seek + 高亮精确时间）
+      · 点片段中部        → 循环预览该片段（再点停止）
+      · 点片段顶部 ✕      → 删除该片段（其余照常烧录）
+    片段之间可留空白，用于挑选不连续的多个片段。
+    """
+    _PAD        = 8
+    _TOP_H      = 20     # 顶部时间读数带高度（播放头/悬停时间显示在此）
+    _EDGE_GRAB  = 7      # 命中边缘的像素容差
+    _MIN_SEG_MS = 200    # 最短片段
+    _MOVE_PX    = 3      # 超过此位移才算"拖动"（区分点击）
+
+    def __init__(self, parent, *, on_change=None, on_seek=None, on_preview=None,
+                 on_pending=None, bg="#161616", **kw):
+        kw.setdefault("height", 58)
+        kw.setdefault("highlightthickness", 0)
+        kw.setdefault("bd", 0)
+        super().__init__(parent, bg=bg, **kw)
+        self.on_change  = on_change
+        self.on_seek    = on_seek
+        self.on_preview = on_preview
+        self.on_pending = on_pending   # 待标记起点变化回调，参数为 ms 或 None
+        self._segments  = []      # [[a_ms, b_ms], ...]
+        self._duration  = 0
+        self._pos       = 0
+        self._fps       = 0.0
+        self._mode      = None    # 'left'|'right'|'body'|'mark'|None
+        self._idx       = -1
+        self._press_x   = 0
+        self._moved     = False
+        self._pending   = None    # 已打起点、待打终点的临时值（ms）；None=无
+        self._hover_x   = None    # 当前光标 x（用于绘制悬停时间提示）；None=不显示
+        self._del_hit   = []      # [(x0,y0,x1,y1,idx)]
+
+        self.bind("<Configure>",       lambda e: self._redraw())
+        self.bind("<ButtonPress-1>",   self._press)
+        self.bind("<B1-Motion>",       self._drag)
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Motion>",          self._hover)
+        self.bind("<Leave>",           self._on_leave)
+        self.after(10, self._redraw)
+
+    # ── public API ──────────────────────────────────────────────────────────
+    def set_duration(self, ms):
+        ms = int(ms or 0)
+        if ms != self._duration:
+            self._duration = ms
+            self._redraw()
+
+    def set_position(self, ms):
+        if self._mode:            # 交互期间忽略外部位置更新，防止播放头被拉回
+            return
+        self._pos = int(ms or 0)
+        self._redraw()
+
+    def set_fps(self, fps):
+        try:
+            self._fps = float(fps or 0)
+        except (TypeError, ValueError):
+            self._fps = 0.0
+
+    def set_segments(self, segs):
+        self._segments = [[int(a), int(b)] for a, b in segs]
+        self._redraw()
+
+    def get_segments(self):
+        return [(int(a), int(b)) for a, b in sorted(self._segments)]
+
+    def clear_pending(self):
+        """取消尚未配对的起点（外部"清除"时调用）。"""
+        if self._pending is not None:
+            self._pending = None
+            if self.on_pending:
+                self.on_pending(None)
+            self._redraw()
+
+    def _fmt(self, ms):
+        """精确到毫秒、并在已知 fps 时附带帧号。"""
+        ms = max(0, int(ms))
+        h = ms // 3600000
+        m = (ms % 3600000) // 60000
+        s = (ms % 60000) // 1000
+        mmm = ms % 1000
+        t = f"{h:02d}:{m:02d}:{s:02d}.{mmm:03d}"
+        if self._fps > 0:
+            t += f"  帧 {int(round(ms / 1000.0 * self._fps))}"
+        return t
+
+    # ── coordinate mapping ────────────────────────────────────────────────────
+    def _x0x1(self):
+        w = self.winfo_width()
+        return self._PAD, w - self._PAD
+
+    def _ms_to_x(self, ms):
+        x0, x1 = self._x0x1()
+        if self._duration <= 0 or x1 <= x0:
+            return x0
+        r = max(0, min(ms, self._duration)) / self._duration
+        return x0 + r * (x1 - x0)
+
+    def _x_to_ms(self, x):
+        x0, x1 = self._x0x1()
+        if self._duration <= 0 or x1 <= x0:
+            return 0
+        r = max(0.0, min(1.0, (x - x0) / (x1 - x0)))
+        return int(r * self._duration)
+
+    # ── drawing ───────────────────────────────────────────────────────────────
+    def _redraw(self):
+        self.delete("all")
+        self._del_hit = []
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 1:
+            return
+        x0, x1 = self._x0x1()
+        top = self._TOP_H
+        cy = top + (h - top) // 2          # 轨道中线（顶部时间带下方）
+        ty0, ty1 = top + 2, h - 4
+
+        self.create_rectangle(x0, cy - 2, x1, cy + 2, fill="#2a2a2a", outline="")
+        if self._duration <= 0:
+            self.create_text((x0 + x1) // 2, cy,
+                             text="加载视频后，点一下打起点、再点一下打终点即可选段（悬停看时间 · 点段循环 · ✕ 删除）",
+                             fill="#555555", font=("Segoe UI", 9))
+            return
+
+        px = self._ms_to_x(self._pos)
+        if px > x0:
+            self.create_rectangle(x0, cy - 2, px, cy + 2, fill="#4a4a4a", outline="")
+
+        for i, (a, b) in enumerate(self._segments):
+            ax = self._ms_to_x(a)
+            bx = self._ms_to_x(b)
+            self.create_rectangle(ax, ty0, bx, ty1,
+                                  fill="#16382b", outline=HL_GREEN, width=1)
+            for ex in (ax, bx):                         # 端点圆点（成对打点的两端）
+                self.create_oval(ex - 5, cy - 5, ex + 5, cy + 5,
+                                 fill=HL_GREEN, outline="")
+            if bx - ax > 26:                            # 够宽才显示删除按钮
+                mx = (ax + bx) / 2
+                self.create_text(mx, ty0 + 8, text="✕",
+                                 fill="#ff7777", font=("Segoe UI", 9, "bold"))
+                self._del_hit.append((mx - 8, ty0, mx + 8, ty0 + 16, i))
+
+        # 待标记起点：橙色竖线 + 圆点（提示"再点一下打终点"）
+        if self._pending is not None:
+            qx = self._ms_to_x(self._pending)
+            self.create_line(qx, ty0, qx, ty1, fill="#d8a657", width=2,
+                             dash=(3, 2))
+            self.create_oval(qx - 5, cy - 5, qx + 5, cy + 5,
+                             fill="#d8a657", outline="")
+
+        self.create_line(px, top, px, h - 1, fill="#ffffff", width=2)
+
+        # 播放头时间：始终在顶部跟随播放头显示（播放时实时跳动）
+        self._draw_time_pill(px, self._fmt(self._pos),
+                             bg="#1c1c1c", fg="#ffffff", outline="#666666")
+
+        # 悬停时间提示：跟随光标，用橙色与播放头时间区分
+        if self._hover_x is not None:
+            hx = max(x0, min(self._hover_x, x1))
+            if abs(hx - px) > 6:        # 与播放头重合时不重复绘制
+                self._draw_time_pill(hx, self._fmt(self._x_to_ms(hx)),
+                                     bg="#3a2d12", fg="#ffd089",
+                                     outline="#d8a657")
+
+    def _draw_time_pill(self, x, txt, *, bg, fg, outline):
+        """在顶部时间带绘制一个时间读数小标签，水平夹在轨道范围内。"""
+        x0, x1 = self._x0x1()
+        x = max(x0, min(x, x1))
+        tw = max(96, int(len(txt) * 8.0))   # 估算文本宽度
+        bx0 = max(x0, min(x - tw // 2, x1 - tw))
+        bx1 = min(x1, bx0 + tw)
+        cy = self._TOP_H // 2
+        self.create_rectangle(bx0, 1, bx1, self._TOP_H - 3,
+                              fill=bg, outline=outline)
+        self.create_text((bx0 + bx1) / 2, cy, text=txt,
+                         fill=fg, font=("Consolas", 11, "bold"))
+
+    # ── interaction ─────────────────────────────────────────────────────────
+    def _hit_edge(self, x):
+        for i, (a, b) in enumerate(self._segments):
+            if abs(x - self._ms_to_x(a)) <= self._EDGE_GRAB:
+                return i, "left"
+            if abs(x - self._ms_to_x(b)) <= self._EDGE_GRAB:
+                return i, "right"
+        return -1, None
+
+    def _hit_body(self, x):
+        for i, (a, b) in enumerate(self._segments):
+            if self._ms_to_x(a) < x < self._ms_to_x(b):
+                return i
+        return -1
+
+    def _hover(self, event):
+        if self._duration <= 0:
+            self._hover_x = None
+            return
+        self._hover_x = event.x
+        i, side = self._hit_edge(event.x)
+        if side:
+            self.configure(cursor="sb_h_double_arrow")
+        elif self._hit_body(event.x) >= 0:
+            self.configure(cursor="hand2")
+        else:
+            self.configure(cursor="crosshair")     # 空白处=可打点
+        self._redraw()
+
+    def _on_leave(self, event):
+        if self._hover_x is not None:
+            self._hover_x = None
+            self._redraw()
+
+    def _press(self, event):
+        if self._duration <= 0:
+            return
+        x = event.x
+        self._press_x = x
+        self._moved = False
+        # 删除按钮优先
+        for (bx0, by0, bx1, by1, idx) in self._del_hit:
+            if bx0 <= x <= bx1 and by0 <= event.y <= by1:
+                self._remove_seg(idx)
+                self._mode = None
+                return
+        i, side = self._hit_edge(x)
+        if side:
+            self._mode, self._idx = side, i
+            return
+        i = self._hit_body(x)
+        if i >= 0:
+            self._mode, self._idx = "body", i
+            return
+        # 空白：单击=打点；拖动=scrub 定位（在 _drag/_release 中区分）
+        self._mode, self._idx = "mark", -1
+
+    def _drag(self, event):
+        if self._duration <= 0 or not self._mode:
+            return
+        if abs(event.x - self._press_x) > self._MOVE_PX:
+            self._moved = True
+        self._hover_x = event.x
+        ms = self._x_to_ms(event.x)
+        if self._mode == "left":
+            seg = self._segments[self._idx]
+            seg[0] = min(ms, seg[1] - self._MIN_SEG_MS)
+            seg[0] = max(0, seg[0])
+            if self.on_seek:
+                self.on_seek(seg[0])
+        elif self._mode == "right":
+            seg = self._segments[self._idx]
+            seg[1] = max(ms, seg[0] + self._MIN_SEG_MS)
+            seg[1] = min(self._duration, seg[1])
+            if self.on_seek:
+                self.on_seek(seg[1])
+        elif self._mode == "mark" and self._moved:
+            # 空白处拖动 → 拖动播放头精细定位（不建段）
+            self._pos = ms
+            if self.on_seek:
+                self.on_seek(ms)
+        self._redraw()
+
+    def _release(self, event):
+        mode = self._mode
+        self._mode = None
+        if self._duration <= 0 or not mode:
+            return
+        idx = self._idx
+        self._idx = -1
+        if mode in ("left", "right"):               # 拖边缘微调 → 写回
+            self._normalize()
+            self._redraw()
+            if self.on_change:
+                self.on_change()
+            return
+        if mode == "body":                          # 片段内点击 → 循环预览
+            if not self._moved and 0 <= idx < len(self._segments) and self.on_preview:
+                a, b = self._segments[idx]
+                self.on_preview(a, b)
+            return
+        if mode == "mark":
+            if self._moved:                         # 是拖动定位，不打点
+                return
+            self._mark_point(self._x_to_ms(event.x))
+
+    def _mark_point(self, ms):
+        """成对打点：第一下记起点，第二下成段。点击同时跳转，便于核对画面。"""
+        ms = max(0, min(int(ms), self._duration))
+        if self.on_seek:
+            self.on_seek(ms)
+        if self._pending is None:
+            self._pending = ms
+            if self.on_pending:
+                self.on_pending(ms)
+            self._redraw()
+            return
+        a, b = min(self._pending, ms), max(self._pending, ms)
+        if b - a < self._MIN_SEG_MS:
+            # 终点离起点太近：当作重新定起点，避免误建过短片段
+            self._pending = ms
+            if self.on_pending:
+                self.on_pending(ms)
+            self._redraw()
+            return
+        self._segments.append([a, b])
+        self._pending = None
+        if self.on_pending:
+            self.on_pending(None)
+        self._normalize()
+        self._redraw()
+        if self.on_change:
+            self.on_change()
+
+    def _remove_seg(self, idx):
+        if 0 <= idx < len(self._segments):
+            del self._segments[idx]
+            self._redraw()
+            if self.on_change:
+                self.on_change()
+
+    def _normalize(self):
+        out = []
+        for a, b in self._segments:
+            a, b = int(min(a, b)), int(max(a, b))
+            a = max(0, min(a, self._duration))
+            b = max(0, min(b, self._duration))
+            if b - a >= self._MIN_SEG_MS:
+                out.append([a, b])
+        out.sort()
+        self._segments = out
