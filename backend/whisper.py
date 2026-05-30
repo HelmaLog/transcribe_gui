@@ -97,14 +97,29 @@ from .translation import (
 
 def _is_youtube_rolling(subs) -> bool:
     """
-    YouTube 自动生成的滚动字幕特征：相邻字幕时间范围大量重叠。
-    检查前 30 对相邻字幕，若超过一半存在时间重叠则判定为滚动格式。
+    YouTube 自动生成的滚动字幕有两种常见特征，命中其一即判定为滚动格式：
+      1) 时间范围大量重叠（相邻字幕 start < 上一条 end）；
+      2) 相邻字幕文字大量重复（上一行被带入下一条逐行往下滚），
+         此类时间戳通常首尾相接、严格不重叠，仅靠特征 1 无法识别。
+    取前 30 对相邻字幕做采样，任一特征命中过半即认为是滚动格式。
+    普通 SRT 相邻字幕文字互不相同、时间也不重叠，两项都不会过半，避免误判。
     """
     if len(subs) < 5:
         return False
     sample = min(len(subs) - 1, 30)
+
     overlaps = sum(1 for i in range(1, sample + 1) if subs[i].start < subs[i - 1].end)
-    return overlaps / sample > 0.5
+    if overlaps / sample > 0.5:
+        return True
+
+    def _lines(sub):
+        return {ln.strip() for ln in sub.content.splitlines() if ln.strip()}
+
+    repeats = 0
+    for i in range(1, sample + 1):
+        if _lines(subs[i]) & _lines(subs[i - 1]):
+            repeats += 1
+    return repeats / sample > 0.5
 
 
 def _flatten_youtube_subs(subs, srt_mod):
