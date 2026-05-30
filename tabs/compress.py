@@ -288,13 +288,15 @@ class CompressTab(Tab):
         threading.Thread(target=probe_task, daemon=True).start()
 
     def _cmp_suggest_output(self, input_path):
-        stem, _ = os.path.splitext(input_path)
-        suffix_map = {
-            "fast": "_x_fast", "balanced": "_x_balanced",
-            "quality": "_x_quality", "custom": "_x_custom",
+        from backend import naming
+        kind_map = {
+            "fast": "压缩Fast", "balanced": "压缩",
+            "quality": "压缩HQ", "custom": "压缩Custom",
         }
-        suffix = suffix_map.get(self._cmp_preset_var.get(), "_compressed")
-        return stem + suffix + ".mp4"
+        kind = kind_map.get(self._cmp_preset_var.get(), "压缩")
+        # 统一命名：时间戳_类型_短名.mp4（防覆盖在压缩执行时再做）
+        return os.path.join(os.path.dirname(input_path),
+                            naming.make_name(kind, input_path, ".mp4"))
 
     # ── Preset selection ──────────────────────────────────────────────────────
 
@@ -394,6 +396,13 @@ class CompressTab(Tab):
         if not output_path:
             self._cmp_log("❌ 请设置输出路径")
             return
+        # 防覆盖：同名已存在则自动追加 _2/_3，绝不冲掉上次的产物
+        from backend import naming
+        _resolved = naming.unique_path(os.path.dirname(output_path),
+                                       os.path.basename(output_path))
+        if _resolved != output_path:
+            self._cmp_log(f"⚠ 同名文件已存在，改存为: {os.path.basename(_resolved)}")
+        output_path = _resolved
 
         # 构造压缩参数
         preset = self._cmp_preset_var.get()

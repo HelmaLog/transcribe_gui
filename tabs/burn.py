@@ -2147,14 +2147,16 @@ class BurnTab(Tab):
             self._burn_btn.configure(state="disabled")
 
     def _suggest_output(self, video_path: str) -> str:
+        from backend import naming
         vp = Path(video_path)
         preset = getattr(self, "_burn_preset_var", None)
-        suffix_map = {
-            "fast": "_burned_fast", "balanced": "_burned",
-            "quality": "_burned_hq", "custom": "_burned_custom",
+        kind_map = {
+            "fast": "烧录Fast", "balanced": "烧录",
+            "quality": "烧录HQ", "custom": "烧录Custom",
         }
-        suffix = suffix_map.get(preset.get() if preset else "balanced", "_burned")
-        return str(vp.parent / (vp.stem + suffix + vp.suffix))
+        kind = kind_map.get(preset.get() if preset else "balanced", "烧录")
+        # 统一命名：时间戳_类型_短名.mp4（防覆盖在烧录执行时再做）
+        return str(vp.parent / naming.make_name(kind, video_path, ".mp4"))
 
     def _select_burn_preset(self, key: str):
         self._burn_preset_var.set(key)
@@ -2390,6 +2392,12 @@ class BurnTab(Tab):
         vp = Path(video_path)
         custom_out = self._burn_out_var.get().strip()
         out_path = Path(custom_out) if custom_out else Path(self._suggest_output(video_path))
+        # 防覆盖：同名已存在则自动追加 _2/_3，绝不冲掉上次的产物
+        from backend import naming
+        _resolved = naming.unique_path(str(out_path.parent), out_path.name)
+        if _resolved != str(out_path):
+            self._burn_log(f"⚠ 同名文件已存在，改存为: {os.path.basename(_resolved)}")
+        out_path = Path(_resolved)
 
         self._burn_btn.configure(text="⏹  停止烧录",
                                 bg="#4a1e1e", fg="#ddaaaa",

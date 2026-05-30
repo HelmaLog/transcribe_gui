@@ -6,6 +6,7 @@ import glob as _glob
 import os
 import threading
 import queue
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -183,24 +184,34 @@ class TranscribeTab(Tab):
         tk.Label(p, text="  转 写", bg=BG, fg="#555555",
                  font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w", padx=16, pady=(12, 0))
 
+        # 视频/音频输入：紧凑的「最近用过」下拉框 + 浏览按钮 + 瘦拖拽提示。
+        # 历史记录持久化在 config 的 recent_videos，重开软件仍在。
         self.video_var = tk.StringVar()
-        drop_frame = tk.Frame(p, bg="#252525")
-        drop_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=(2, 4))
-        drop_frame.columnconfigure(0, weight=1)
-        self.drop_label = tk.Label(drop_frame, text="🎬  拖拽视频到此处，或点击浏览",
-                                   bg="#252525", fg="#666666", font=("Segoe UI", 10),
-                                   pady=14, cursor="hand2")
-        self.drop_label.grid(row=0, column=0, sticky="ew")
-        self.video_entry = tk.Entry(drop_frame, textvariable=self.video_var,
-                                    bg="#252525", fg="#aaaaaa", insertbackground="white",
-                                    relief="flat", font=("Segoe UI", 9), bd=0, justify="center")
-        self.video_entry.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 4))
-        tk.Button(drop_frame, text="浏览文件", command=self._browse_video,
-                  bg="#3a3a3a", fg="#cccccc", relief="flat", padx=12, pady=3,
-                  font=("Segoe UI", 9), cursor="hand2"
-                  ).grid(row=2, column=0, pady=(0, 10))
+        self._recent_videos = [p for p in cfg.get("recent_videos", []) if isinstance(p, str)]
+
+        vf = tk.Frame(p, bg=BG)
+        vf.grid(row=1, column=0, columnspan=3, sticky="ew", padx=16, pady=(2, 2))
+        vf.columnconfigure(0, weight=1)
+        self._video_combo = ttk.Combobox(
+            vf, textvariable=self.video_var, values=self._recent_videos,
+            font=("Segoe UI", 10), state="normal")
+        self._video_combo.grid(row=0, column=0, sticky="ew", ipady=2)
+        self._video_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._on_video_chosen(self.video_var.get()))
+        tk.Button(vf, text="浏览", command=self._browse_video,
+                  bg="#3a3a3a", fg="#cccccc", relief="flat", padx=12,
+                  font=("Segoe UI", 9), cursor="hand2",
+                  activebackground="#4a4a4a").grid(row=0, column=1, padx=(6, 0))
+        tk.Label(vf, text="🎬 拖拽视频/音频到上方框，或点开下拉选最近用过的",
+                 bg=BG, fg="#555555", font=("Segoe UI", 8), anchor="w"
+                 ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(1, 0))
+        # 重开软件时，自动回填最近一个仍存在的视频
+        for _p in self._recent_videos:
+            if os.path.exists(_p):
+                self.video_var.set(_p)
+                break
         if HAS_DND:
-            for w in [drop_frame, self.drop_label, self.video_entry]:
+            for w in (vf, self._video_combo):
                 w.drop_target_register(DND_FILES)
                 w.dnd_bind("<<Drop>>", self._on_drop)
 
@@ -272,6 +283,16 @@ class TranscribeTab(Tab):
         olbl("精度")
         self.compute_var = tk.StringVar(value=cfg["compute_type"])
         ocombo(self.compute_var, ["float16", "float32", "int8"], 9)
+        olbl("束宽")
+        self.beam_var = tk.StringVar(value=str(cfg.get("beam_size", "1")))
+        oentry(self.beam_var, 3)
+        tk.Label(f_opts, text="1=最快·越大越准越慢", bg=BG, fg="#666666",
+                 font=("Segoe UI", 8)).pack(side="left", padx=(0, 14))
+        olbl("CPU线程")
+        self.cpu_threads_var = tk.StringVar(value=str(cfg.get("cpu_threads", "0")))
+        oentry(self.cpu_threads_var, 3)
+        tk.Label(f_opts, text="0=自动·可调8/16", bg=BG, fg="#666666",
+                 font=("Segoe UI", 8)).pack(side="left", padx=(0, 14))
         olbl("语言")
         self.lang_var = tk.StringVar(value=cfg["language"])
         oentry(self.lang_var, 5)
@@ -448,6 +469,10 @@ class TranscribeTab(Tab):
             font=("Segoe UI", 11), padx=18, pady=8,
             cursor="hand2", activebackground="#4a4a4a", state="disabled")
         self._open_folder_btn.pack(side="left", padx=(10, 0))
+        # 字幕生成方式 / 耗时，常驻显示在按钮行右侧，无需翻日志即可一眼看到
+        self._status_var = tk.StringVar(value="")
+        tk.Label(f_btn_row, textvariable=self._status_var, bg=BG, fg="#888888",
+                 font=("Segoe UI", 9)).pack(side="left", padx=(16, 0))
 
         p.rowconfigure(16, weight=1)
         self.log_box = scrolledtext.ScrolledText(p, bg="#141414", fg="#cccccc",
@@ -459,6 +484,10 @@ class TranscribeTab(Tab):
 
         self._on_provider_change()
         self._on_output_mode_change()
+        # 启动时若已回填最近视频，扫描其目录字幕填入下拉（不自动选中）
+        _v = self.video_var.get().strip()
+        if _v and os.path.isdir(os.path.dirname(_v)):
+            self._scan_srt_options(os.path.dirname(_v), auto_select=False)
         self.app.after(100, self._poll_log)
 
     # ── Log polling ───────────────────────────────────────────────────────────
@@ -704,10 +733,34 @@ class TranscribeTab(Tab):
 
     # ── File browsing / DnD ───────────────────────────────────────────────────
 
+    def _remember_video(self, path: str):
+        """把视频路径置顶进最近列表（去重、限 12 条），并刷新下拉框。"""
+        path = (path or "").strip()
+        if not path:
+            return
+        norm = os.path.normcase(os.path.abspath(path))
+        self._recent_videos = [
+            p for p in self._recent_videos
+            if os.path.normcase(os.path.abspath(p)) != norm]
+        self._recent_videos.insert(0, path)
+        self._recent_videos = self._recent_videos[:12]
+        if hasattr(self, "_video_combo"):
+            self._video_combo["values"] = self._recent_videos
+
+    def _on_video_chosen(self, path: str):
+        """选定视频后的统一处理：记入历史 + 扫描同目录字幕填入下拉（不自动选中）。"""
+        path = (path or "").strip()
+        if not path:
+            return
+        self.video_var.set(path)
+        self._remember_video(path)
+        folder = os.path.dirname(path)
+        if folder and os.path.isdir(folder):
+            self._scan_srt_options(folder, auto_select=False)
+
     def _on_drop(self, event):
         path = event.data.strip().strip("{}")
-        self.video_var.set(path)
-        self.drop_label.configure(fg="#aaaaaa")
+        self._on_video_chosen(path)
 
     def _on_drop_srt(self, event):
         path = event.data.strip().strip("{}")
@@ -718,8 +771,7 @@ class TranscribeTab(Tab):
         path = filedialog.askopenfilename(
             filetypes=[("视频/音频", "*.mp4 *.mkv *.mov *.avi *.mp3 *.wav *.m4a"), ("所有文件", "*.*")])
         if path:
-            self.video_var.set(path)
-            self.drop_label.configure(fg="#aaaaaa")
+            self._on_video_chosen(path)
 
     def _browse_model(self):
         path = filedialog.askdirectory(title="选择Whisper模型文件夹")
@@ -757,9 +809,11 @@ class TranscribeTab(Tab):
         self.srt_var.set(full_path)
         self._srt_display_var.set(os.path.basename(full_path) if full_path else "")
 
-    def _scan_srt_options(self, folder: str, select_path: str = ""):
+    def _scan_srt_options(self, folder: str, select_path: str = "",
+                          auto_select: bool = True):
         """扫描 folder 下所有 .srt 填入下拉框（英文字幕排前）。
-        select_path 非空且存在则选中它，否则选中排序后第一个。"""
+        select_path 非空且存在则选中它；否则当 auto_select 为真才选中第一个，
+        为假时仅填充下拉列表、保持未选中（转写选视频时用，避免误判为"用已有字幕"）。"""
         raw_folder = os.path.abspath(folder)
         try:
             found = [os.path.join(raw_folder, f) for f in os.listdir(raw_folder)
@@ -784,11 +838,13 @@ class TranscribeTab(Tab):
                 if os.path.normcase(os.path.abspath(p)) == norm:
                     self._srt_combo.current(i)
                     break
-        elif found:
+        elif found and auto_select:
             self._set_srt(found[0])
             self._srt_combo.current(0)
         else:
+            # 只填充列表、不选中：点开下拉即可看到该目录所有字幕，但默认仍走识别
             self._set_srt("")
+            self._srt_combo.set("")
 
     def _add_to_srt_combo(self, full_path: str):
         norm = os.path.normcase(full_path)
@@ -822,7 +878,7 @@ class TranscribeTab(Tab):
         """下载完成后由下载页调用：填入视频与英文字幕，并扫描同目录其它字幕供切换。"""
         if video_path and os.path.exists(video_path):
             self.video_var.set(video_path)
-            self.drop_label.configure(fg="#aaaaaa")
+            self._remember_video(video_path)
         scan_folder = folder or (
             os.path.dirname(srt_path) if srt_path
             else (os.path.dirname(video_path) if video_path else ""))
@@ -845,6 +901,8 @@ class TranscribeTab(Tab):
         if not video and not srt_file:
             self._log("❌ 请先选择视频文件，或提供已有英文 SRT")
             return
+        if video:
+            self._remember_video(video)   # 手动输入的路径此时也并入历史
         if srt_file and not os.path.exists(srt_file):
             self._log("❌ SRT 文件不存在，请重新选择")
             return
@@ -866,6 +924,14 @@ class TranscribeTab(Tab):
             batch_size = int(self.batch_var.get())
         except ValueError:
             batch_size = 15
+        try:
+            beam_size = max(1, int(self.beam_var.get()))
+        except ValueError:
+            beam_size = 1
+        try:
+            cpu_threads = max(0, int(self.cpu_threads_var.get()))
+        except ValueError:
+            cpu_threads = 0
 
         provider = self.provider_var.get()
         config = {
@@ -874,6 +940,8 @@ class TranscribeTab(Tab):
             "model_path": model,
             "device": self.device_var.get(),
             "compute_type": self.compute_var.get(),
+            "beam_size": beam_size,
+            "cpu_threads": cpu_threads,
             "language": self.lang_var.get().strip(),
             "max_chars_en": max_chars_en,
             "max_chars_zh": max_chars_zh,
@@ -903,11 +971,27 @@ class TranscribeTab(Tab):
         label = os.path.basename(srt_file) if srt_file else os.path.basename(video)
         self._log(f"▶ {label}")
 
+        # 生成方式描述（与后端日志一致），常驻显示在按钮行
+        if srt_file:
+            gen_method = "已有英文字幕"
+        else:
+            gen_method = (f"Whisper 转写·{config['device']}·"
+                          f"{config['compute_type']}·束宽{beam_size}")
+        self._status_var.set(f"⏳ 处理中…（{gen_method}）")
+
         stop_event = self._stop_event
+        t_start = time.monotonic()
 
         def task():
             result = run_transcribe(config, self._log, stop_event)
             self._is_running = False
+            elapsed = time.monotonic() - t_start
+            stopped = bool(stop_event and stop_event.is_set())
+            mins, secs = divmod(int(round(elapsed)), 60)
+            dur = f"{mins}分{secs}秒" if mins else f"{secs}秒"
+            prefix = "⏹ 已停止" if stopped else "✅ 完成"
+            self.app.after(0, lambda: self._status_var.set(
+                f"{prefix}　方式: {gen_method}　耗时: {dur}"))
             # run_transcribe 返回 (save_dir, primary_srt)；兼容旧的单值返回
             if isinstance(result, tuple):
                 result_dir, primary_srt = result
@@ -1025,6 +1109,8 @@ class TranscribeTab(Tab):
             "model_path":          self.model_var.get().strip(),
             "device":              self.device_var.get(),
             "compute_type":        self.compute_var.get(),
+            "beam_size":           self.beam_var.get().strip(),
+            "cpu_threads":         self.cpu_threads_var.get().strip(),
             "language":            self.lang_var.get().strip(),
             "max_chars_en":        self.chars_var.get().strip(),
             "max_chars_zh":        self.chars_zh_var.get().strip(),
@@ -1047,4 +1133,5 @@ class TranscribeTab(Tab):
             "output_mode":         self.output_mode_var.get(),
             "batch_size":          self.batch_var.get().strip(),
             "snap_to_30fps":       self.snap_30fps_var.get(),
+            "recent_videos":       list(getattr(self, "_recent_videos", [])),
         }

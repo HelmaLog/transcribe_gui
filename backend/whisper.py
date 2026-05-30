@@ -89,10 +89,19 @@ def _close_gaps(subs, max_gap_s: float = 1.0) -> int:
     return count
 
 
+from . import naming
 from .config import DEFAULT_MODELS_GEMINI
 from .translation import (
     translate_batch, translate_batch_ark, translate_batch_gemini, translate_batch_pioneer,
 )
+
+
+def _fmt_duration(sec: float) -> str:
+    """把秒数格式化为「X分Y秒」/「Y秒」，用于展示字幕生成耗时。"""
+    sec = max(0, int(round(sec)))
+    if sec >= 60:
+        return f"{sec // 60}分{sec % 60}秒"
+    return f"{sec}秒"
 
 
 def _is_youtube_rolling(subs) -> bool:
@@ -156,15 +165,19 @@ def _flatten_youtube_subs(subs, srt_mod):
 def run_transcribe(config, log, stop_event=None):
     try:
         import srt
+        import time
         from srt_equalizer import srt_equalizer
-        from datetime import date
-        import re as _re
 
+        t_start = time.monotonic()
         video_path = config.get("video_path", "")
         srt_path = config.get("srt_path", "")
         model_path = config.get("model_path", "")
         device = config["device"]
         compute_type = config["compute_type"]
+        # 束宽（beam_size）：解码时每步保留的候选路径数。1=贪心、最快；越大越准、越慢。
+        beam_size = int(config.get("beam_size", 1) or 1)
+        # CPU 线程数：0 = 由 CTranslate2 自动按物理核心数选取（通常即最优）。
+        cpu_threads = int(config.get("cpu_threads", 0) or 0)
         language = config["language"]
         initial_prompt = config["initial_prompt"]
         save_path = config["save_path"]
@@ -201,6 +214,13 @@ def run_transcribe(config, log, stop_event=None):
         batch_size = config["batch_size"]
         use_existing_srt = bool(srt_path and os.path.exists(srt_path))
         primary_srt = ""   # 实际保存、用于烧录的首选字幕（翻译结果优先于英文）
+        # 字幕来源/生成方式描述，用于日志与界面展示
+        if use_existing_srt:
+            gen_method = "已有英文字幕"
+        else:
+            _thr = f"{cpu_threads}线程" if cpu_threads else "线程自动"
+            gen_method = (f"Whisper 转写 · {device} · {compute_type} · "
+                          f"束宽{beam_size} · {_thr}")
 
         if use_existing_srt:
             log(f"使用已有英文字幕: {os.path.basename(srt_path)}")
@@ -227,25 +247,27 @@ def run_transcribe(config, log, stop_event=None):
                     sub.index = i
                 log(f"切分完成，共 {len(split_subs)} 条")
 
-            srt_stem = os.path.splitext(os.path.basename(srt_path))[0]
-            if srt_stem.startswith("英文_"):
-                srt_stem = srt_stem[3:]
-            elif srt_stem.endswith("_英文"):
-                srt_stem = srt_stem[:-3]
-            short_name = srt_stem
+            name_source = srt_path   # 短标题取自字幕文件名（naming 会剥离旧标记）
             ref_dir = os.path.dirname(os.path.abspath(srt_path))
         else:
             from faster_whisper import WhisperModel
 
             log(f"加载模型: {model_path}")
-            model = WhisperModel(model_path, device=device, compute_type=compute_type)
-            log("模型加载完成")
+            model = WhisperModel(model_path, device=device,
+                                 compute_type=compute_type, cpu_threads=cpu_threads)
+            if device == "cpu":
+                import os as _os
+                _logical = _os.cpu_count() or 0
+                _used = cpu_threads if cpu_threads else "自动（由引擎按物理核心选取）"
+                log(f"模型加载完成 · CPU 线程={_used}（本机逻辑核心 {_logical}）")
+            else:
+                log("模型加载完成")
 
-            log(f"开始转写: {os.path.basename(video_path)}")
+            log(f"开始转写: {os.path.basename(video_path)}（{gen_method}）")
             segments, info = model.transcribe(
                 video_path,
                 language=language if language else None,
-                beam_size=5,
+                beam_size=beam_size,
                 vad_filter=True,
                 vad_parameters=dict(
                     threshold=0.5,
@@ -288,10 +310,7 @@ def run_transcribe(config, log, stop_event=None):
                     sub.index = i
                 log(f"切分完成，共 {len(split_subs)} 条")
 
-            video_stem = os.path.splitext(os.path.basename(video_path))[0]
-            clean_name = _re.sub(r"[^\w\s]", " ", video_stem).strip()
-            words = clean_name.split()[:8]
-            short_name = " ".join(words) + f"_{date.today().strftime('%Y-%m-%d')}"
+            name_source = video_path   # 短标题取自视频文件名
             ref_dir = os.path.dirname(video_path)
 
         if save_path:
@@ -301,7 +320,9 @@ def run_transcribe(config, log, stop_event=None):
         else:
             save_dir = ref_dir
 
-        base_path = os.path.join(save_dir, short_name)
+        # 同一次任务里英文/双语/中文字幕共用同一时间戳，便于在文件夹里成组排列
+        from datetime import datetime as _datetime
+        name_ts = _datetime.now()
 
         # ── 清洗特殊符号 ──
         # 必须放在「闭合空隙」之前：先清洗、并丢弃整条只剩符号（清洗后变空）的字幕，
@@ -335,7 +356,7 @@ def run_transcribe(config, log, stop_event=None):
         # ── 保存英文字幕 ──
         # 从视频转写时始终保存；使用现有 SRT 且模式为"只生成英文"时也保存
         if not use_existing_srt or output_mode == "english_only":
-            en_path = os.path.join(save_dir, "英文_" + short_name + ".srt")
+            en_path = naming.make_path(save_dir, "英文", name_source, ".srt", name_ts)
             with open(en_path, "w", encoding="utf-8") as f:
                 f.write(srt.compose(split_subs))
             primary_srt = en_path
@@ -423,9 +444,9 @@ def run_transcribe(config, log, stop_event=None):
                         ))
 
                 if output_mode == "chinese_only":
-                    prefix = "部分中文_" if stopped else "中文_"
+                    kind = "部分中文" if stopped else "中文"
                 else:
-                    prefix = "部分双语_" if stopped else "双语_"
+                    kind = "部分双语" if stopped else "双语"
                 if snap:
                     _snap_srt_to_30fps(output_subs)
                 n = _fix_overlaps(output_subs)
@@ -435,7 +456,7 @@ def run_transcribe(config, log, stop_event=None):
                 g = _close_gaps(output_subs, gap_max)
                 if g:
                     log(f"🔗 已闭合{mode_name}字幕中 {g} 处≤{gap_max:g}s 空隙，字幕连续无闪烁")
-                out_path = os.path.join(save_dir, prefix + short_name + ".srt")
+                out_path = naming.make_path(save_dir, kind, name_source, ".srt", name_ts)
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(srt.compose(output_subs))
                 primary_srt = out_path   # 翻译结果优先用于烧录
@@ -443,6 +464,9 @@ def run_transcribe(config, log, stop_event=None):
                     log(f"⏹ 已停止，部分{mode_name}字幕已保存（{len(translations)}/{len(split_subs)} 行）: {out_path}")
                 else:
                     log(f"✅ {mode_name}字幕已保存: {out_path}")
+
+        elapsed = time.monotonic() - t_start
+        log(f"⏱ 字幕生成耗时: {_fmt_duration(elapsed)}（方式: {gen_method}）")
 
         if stop_event and stop_event.is_set():
             log("⏹ 任务已停止")
