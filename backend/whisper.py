@@ -3,9 +3,31 @@ Whisper transcription logic.
 """
 
 import os
+import re
 from datetime import timedelta
 
 _FRAME_MS = 1000.0 / 30
+
+# 字幕清洗：去掉不符合人类阅读习惯的特殊符号（转写/格式残留），例如：
+#   尖括号 < > （含 << >>，常见转写噪声/伪引号）、音符 ♪♫♬♩、
+#   markdown 残留 * `、竖线 |、波浪号/脱字符 ~ ^。
+# 保留所有正常中英文标点：, . ! ? ; : ' " - … 及 ，。！？、；：""''《》（）「」 等，
+# 不动括号 ()[]{}（属正常表达），不删带词括注（如 (laughs)）以免误伤。
+_CAPTION_JUNK_RE = re.compile(r"[<>♪♫♬♩*`|~^]+")
+
+
+def _clean_caption(text: str) -> str:
+    """按人类阅读习惯清洗单条字幕文字；多行分别处理，丢弃清洗后变空的行。"""
+    if not text:
+        return text
+    out_lines = []
+    for line in text.splitlines():
+        line = _CAPTION_JUNK_RE.sub("", line)
+        # 折叠清洗后残留的多余空白，并去掉首尾空格
+        line = re.sub(r"[ \t]{2,}", " ", line).strip()
+        if line:
+            out_lines.append(line)
+    return "\n".join(out_lines)
 
 
 def _snap_ms(ms):
@@ -163,6 +185,7 @@ def run_transcribe(config, log, stop_event=None):
 
         batch_size = config["batch_size"]
         use_existing_srt = bool(srt_path and os.path.exists(srt_path))
+        primary_srt = ""   # 实际保存、用于烧录的首选字幕（翻译结果优先于英文）
 
         if use_existing_srt:
             log(f"使用已有英文字幕: {os.path.basename(srt_path)}")
@@ -265,6 +288,24 @@ def run_transcribe(config, log, stop_event=None):
 
         base_path = os.path.join(save_dir, short_name)
 
+        # ── 清洗特殊符号 ──
+        # 必须放在「闭合空隙」之前：先清洗、并丢弃整条只剩符号（清洗后变空）的字幕，
+        # 再让闭合空隙跨过这些被删条目把时间轴接上，避免留下空白/不连续字幕。
+        _cleaned = 0
+        for sub in split_subs:
+            new_c = _clean_caption(sub.content)
+            if new_c != sub.content:
+                _cleaned += 1
+            sub.content = new_c
+        _before = len(split_subs)
+        split_subs = [s for s in split_subs if s.content.strip()]
+        _dropped = _before - len(split_subs)
+        for i, sub in enumerate(split_subs, 1):
+            sub.index = i
+        if _cleaned:
+            log(f"🧹 已清理 {_cleaned} 条字幕中的特殊符号"
+                + (f"，并删除 {_dropped} 条仅含符号的空字幕" if _dropped else ""))
+
         snap = config.get("snap_to_30fps", False)
         if snap:
             _snap_srt_to_30fps(split_subs)
@@ -282,6 +323,7 @@ def run_transcribe(config, log, stop_event=None):
             en_path = os.path.join(save_dir, "英文_" + short_name + ".srt")
             with open(en_path, "w", encoding="utf-8") as f:
                 f.write(srt.compose(split_subs))
+            primary_srt = en_path
             log(f"✅ 英文字幕已保存: {en_path}")
 
         # ── 翻译并保存中文 / 双语字幕 ──
@@ -337,8 +379,11 @@ def run_transcribe(config, log, stop_event=None):
                     for sub in split_subs:
                         if sub.index in translations:
                             zh_text, emoji = translations[sub.index]
+                            zh_text = _clean_caption(zh_text)  # 译文也清洗特殊符号
                         else:
                             zh_text, emoji = sub.content, ""  # 翻译失败保留原文
+                        if not zh_text.strip():
+                            continue  # 译文清洗后为空则跳过，不产出空字幕
                         temp = srt.Subtitle(0, sub.start, sub.end, zh_text)
                         parts = srt_equalizer.split_subtitle(temp, max_chars_zh)
                         if emoji:
@@ -352,8 +397,10 @@ def run_transcribe(config, log, stop_event=None):
                     for sub in split_subs:
                         if sub.index in translations:
                             zh_text, emoji = translations[sub.index]
-                            zh_line = f"{zh_text} {emoji}" if emoji else zh_text
-                            content = f"{zh_line}\n{sub.content}"
+                            zh_text = _clean_caption(zh_text)  # 译文也清洗特殊符号
+                            zh_line = f"{zh_text} {emoji}".strip() if emoji else zh_text
+                            # 译文清洗后若为空，只留英文行，避免出现空中文行+换行
+                            content = f"{zh_line}\n{sub.content}" if zh_line else sub.content
                         else:
                             content = sub.content  # 翻译失败保留原文
                         output_subs.append(srt.Subtitle(
@@ -376,6 +423,7 @@ def run_transcribe(config, log, stop_event=None):
                 out_path = os.path.join(save_dir, prefix + short_name + ".srt")
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(srt.compose(output_subs))
+                primary_srt = out_path   # 翻译结果优先用于烧录
                 if stopped:
                     log(f"⏹ 已停止，部分{mode_name}字幕已保存（{len(translations)}/{len(split_subs)} 行）: {out_path}")
                 else:
@@ -386,7 +434,7 @@ def run_transcribe(config, log, stop_event=None):
         else:
             log("🎉 全部完成！")
 
-        return save_dir
+        return save_dir, primary_srt
 
     except Exception as e:
         import traceback

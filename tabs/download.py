@@ -10,7 +10,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 
 from backend import query_video_info, run_download
-from .base import Tab, BG
+from .base import Tab, BG, HL_GREEN
 
 
 # ── Format selection dialog ───────────────────────────────────────────────────
@@ -301,6 +301,8 @@ class DownloadTab(Tab):
             p, bg="#141414", fg="#cccccc", font=("Consolas", 9),
             relief="flat", state="disabled", height=10)
         self.dl_log_box.grid(row=8, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        # 关键行（完成/✅）高亮成亮绿
+        self.dl_log_box.tag_configure("hl", foreground=HL_GREEN)
 
         self.app.after(100, self._poll_dl_log)
 
@@ -311,7 +313,8 @@ class DownloadTab(Tab):
             while True:
                 msg = self._dl_log_queue.get_nowait()
                 self.dl_log_box.configure(state="normal")
-                self.dl_log_box.insert("end", msg + "\n")
+                is_hl = ("✅" in msg or "完成" in msg)
+                self.dl_log_box.insert("end", msg + "\n", ("hl",) if is_hl else ())
                 self.dl_log_box.see("end")
                 self.dl_log_box.configure(state="disabled")
         except queue.Empty:
@@ -462,13 +465,56 @@ class DownloadTab(Tab):
                 self._dl_task_var.set("")
                 if result:
                     self._dl_progress["value"] = 100
-                    self._dl_speed_label.configure(text="✅ 完成")
+                    self._dl_speed_label.configure(text="✅ 完成", fg=HL_GREEN)
+                    # 工作流：下载成功后自动把视频+英文字幕送到转写页并切换
+                    if not fmt_opts.get('subtitle_only'):
+                        self._handoff_to_transcribe(result)
                 else:
                     self._dl_speed_label.configure(text="")
 
             self.app.after(0, finish)
 
         threading.Thread(target=task, daemon=True).start()
+
+    def _handoff_to_transcribe(self, folder: str):
+        """下载完成后，自动挑出视频与英文字幕送到转写页并切换过去。
+
+        下载产物都在同一个标题目录下；视频取最新的媒体文件，字幕优先英文
+        （文件名含 英文/.en/english），其余字幕一并交给转写页下拉框供切换。
+        """
+        if not folder or not os.path.isdir(folder):
+            return
+        try:
+            entries = os.listdir(folder)
+        except OSError:
+            return
+
+        video_exts = (".mp4", ".mkv", ".webm", ".mov", ".avi")
+        vids = [os.path.join(folder, f) for f in entries
+                if os.path.splitext(f)[1].lower() in video_exts]
+        vids.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        video = vids[0] if vids else ""
+
+        srts = [os.path.join(folder, f) for f in entries
+                if f.lower().endswith(".srt")]
+
+        def _en_key(p):
+            b = os.path.basename(p).lower()
+            is_en = ("英文" in b) or (".en" in b) or ("english" in b)
+            return (0 if is_en else 1, b)
+
+        srts.sort(key=_en_key)
+        srt = srts[0] if srts else ""
+
+        tr = getattr(self.app, "transcribe_tab", None)
+        if tr is None or not hasattr(tr, "receive_download"):
+            return
+        tr.receive_download(video, srt, folder)
+        try:
+            nb = self.app._nb
+            nb.select(self.app.tabs.index(tr))
+        except Exception:
+            pass
 
     # ── Config save ───────────────────────────────────────────────────────────
 

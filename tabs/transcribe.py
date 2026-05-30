@@ -29,7 +29,7 @@ def _strip_model_marker(name: str) -> str:
         if name.endswith(suffix):
             return name[:-2]
     return name
-from .base import Tab, BG
+from .base import Tab, BG, HL_GREEN
 
 
 # Whisper 初始提示词默认值：一句带标点、大小写规范的英文，作为"上文"喂给模型，
@@ -226,11 +226,29 @@ class TranscribeTab(Tab):
                   ).grid(row=0, column=1, padx=(6, 0))
         self._save_frame.grid_remove()
 
-        self.srt_var = tk.StringVar()
-        srt_entry = self._entry_row(p, 3, "现有英文 SRT（可选，提供后跳过本地识别）", self.srt_var, self._browse_srt)
+        # 现有英文 SRT：下拉框，自动列出同目录的其它字幕，可按需切换
+        self.srt_var          = tk.StringVar()   # 实际选中的字幕完整路径（_start 读取）
+        self._srt_display_var = tk.StringVar()   # 下拉框显示的文件名
+        self._srt_combo_paths = []
+        self._lbl(p, "现有英文 SRT（可选，提供后跳过本地识别）").grid(
+            row=6, column=0, columnspan=3, sticky="w", padx=16, pady=(8, 0))
+        sf = tk.Frame(p, bg=BG)
+        sf.grid(row=7, column=0, columnspan=3, sticky="ew", padx=16, pady=(2, 0))
+        sf.columnconfigure(0, weight=1)
+        self._srt_combo = ttk.Combobox(
+            sf, textvariable=self._srt_display_var,
+            font=("Segoe UI", 10), state="normal")
+        self._srt_combo.grid(row=0, column=0, sticky="ew", ipady=2)
+        self._srt_combo.bind("<<ComboboxSelected>>", self._on_srt_combo_selected)
+        self._srt_combo.bind("<Return>", lambda e: self._on_srt_combo_enter())
+        tk.Button(sf, text="浏览", command=self._browse_srt,
+                  bg="#3a3a3a", fg="#cccccc", relief="flat", padx=12,
+                  font=("Segoe UI", 9), cursor="hand2",
+                  activebackground="#4a4a4a").grid(row=0, column=1, padx=(6, 0))
         if HAS_DND:
-            srt_entry.drop_target_register(DND_FILES)
-            srt_entry.dnd_bind("<<Drop>>", self._on_drop_srt)
+            for w in (sf, self._srt_combo):
+                w.drop_target_register(DND_FILES)
+                w.dnd_bind("<<Drop>>", self._on_drop_srt)
 
         f_opts = tk.Frame(p, bg=BG)
         f_opts.grid(row=9, column=0, sticky="ew", padx=16, pady=8)
@@ -436,6 +454,8 @@ class TranscribeTab(Tab):
                                                  font=("Consolas", 9), relief="flat",
                                                  state="disabled", height=10)
         self.log_box.grid(row=16, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        # 关键行（完成/就绪/✅）高亮成亮绿，方便一眼看到重要状态
+        self.log_box.tag_configure("hl", foreground=HL_GREEN)
 
         self._on_provider_change()
         self._on_output_mode_change()
@@ -448,7 +468,9 @@ class TranscribeTab(Tab):
             while True:
                 msg = self._log_queue.get_nowait()
                 self.log_box.configure(state="normal")
-                self.log_box.insert("end", msg + "\n")
+                # 含 ✅ 或「完成/就绪」的关键行整行高亮亮绿
+                is_hl = ("✅" in msg or "完成" in msg or "就绪" in msg)
+                self.log_box.insert("end", msg + "\n", ("hl",) if is_hl else ())
                 self.log_box.see("end")
                 self.log_box.configure(state="disabled")
         except queue.Empty:
@@ -689,7 +711,8 @@ class TranscribeTab(Tab):
 
     def _on_drop_srt(self, event):
         path = event.data.strip().strip("{}")
-        self.srt_var.set(path)
+        if path:
+            self._add_to_srt_combo(path)
 
     def _browse_video(self):
         path = filedialog.askopenfilename(
@@ -725,7 +748,92 @@ class TranscribeTab(Tab):
         path = filedialog.askopenfilename(
             filetypes=[("SRT字幕", "*.srt"), ("所有文件", "*.*")])
         if path:
-            self.srt_var.set(path)
+            self._add_to_srt_combo(path)
+
+    # ── SRT combobox (folder scan) ────────────────────────────────────────────
+
+    def _set_srt(self, full_path: str):
+        """同步设定真实路径 srt_var 与下拉框显示名。"""
+        self.srt_var.set(full_path)
+        self._srt_display_var.set(os.path.basename(full_path) if full_path else "")
+
+    def _scan_srt_options(self, folder: str, select_path: str = ""):
+        """扫描 folder 下所有 .srt 填入下拉框（英文字幕排前）。
+        select_path 非空且存在则选中它，否则选中排序后第一个。"""
+        raw_folder = os.path.abspath(folder)
+        try:
+            found = [os.path.join(raw_folder, f) for f in os.listdir(raw_folder)
+                     if f.lower().endswith(".srt")
+                     and os.path.isfile(os.path.join(raw_folder, f))]
+        except OSError:
+            found = []
+
+        def _key(p):
+            b = os.path.basename(p).lower()
+            is_en = ("英文" in b) or (".en" in b) or ("english" in b)
+            return (0 if is_en else 1, b)
+
+        found.sort(key=_key)
+        self._srt_combo_paths = found
+        self._srt_combo["values"] = [os.path.basename(p) for p in found]
+
+        if select_path and os.path.exists(select_path):
+            self._set_srt(select_path)
+            norm = os.path.normcase(os.path.abspath(select_path))
+            for i, p in enumerate(found):
+                if os.path.normcase(os.path.abspath(p)) == norm:
+                    self._srt_combo.current(i)
+                    break
+        elif found:
+            self._set_srt(found[0])
+            self._srt_combo.current(0)
+        else:
+            self._set_srt("")
+
+    def _add_to_srt_combo(self, full_path: str):
+        norm = os.path.normcase(full_path)
+        self._srt_combo_paths = [p for p in self._srt_combo_paths
+                                 if os.path.normcase(p) != norm]
+        self._srt_combo_paths.insert(0, full_path)
+        self._srt_combo["values"] = [os.path.basename(p)
+                                     for p in self._srt_combo_paths]
+        self._srt_combo.current(0)
+        self._set_srt(full_path)
+
+    def _on_srt_combo_selected(self, _event=None):
+        idx = self._srt_combo.current()
+        if 0 <= idx < len(self._srt_combo_paths):
+            self._set_srt(self._srt_combo_paths[idx])
+
+    def _on_srt_combo_enter(self):
+        text = self._srt_display_var.get().strip()
+        if not text:
+            self.srt_var.set("")
+            return
+        for p in self._srt_combo_paths:
+            if (os.path.basename(p) == text
+                    or os.path.normcase(p) == os.path.normcase(text)):
+                self._set_srt(p)
+                return
+        if os.path.exists(text):
+            self._add_to_srt_combo(text)
+
+    def receive_download(self, video_path: str, srt_path: str, folder: str):
+        """下载完成后由下载页调用：填入视频与英文字幕，并扫描同目录其它字幕供切换。"""
+        if video_path and os.path.exists(video_path):
+            self.video_var.set(video_path)
+            self.drop_label.configure(fg="#aaaaaa")
+        scan_folder = folder or (
+            os.path.dirname(srt_path) if srt_path
+            else (os.path.dirname(video_path) if video_path else ""))
+        if scan_folder and os.path.isdir(scan_folder):
+            self._scan_srt_options(scan_folder, select_path=srt_path or "")
+        elif srt_path:
+            self._add_to_srt_combo(srt_path)
+        self._log(
+            f"↪ 已从下载接收：视频="
+            f"{os.path.basename(video_path) if video_path else '(无)'}，字幕="
+            f"{os.path.basename(srt_path) if srt_path else '(未找到)'}")
 
     # ── Start / Stop ──────────────────────────────────────────────────────────
 
@@ -798,12 +906,18 @@ class TranscribeTab(Tab):
         stop_event = self._stop_event
 
         def task():
-            result_dir = run_transcribe(config, self._log, stop_event)
+            result = run_transcribe(config, self._log, stop_event)
             self._is_running = False
+            # run_transcribe 返回 (save_dir, primary_srt)；兼容旧的单值返回
+            if isinstance(result, tuple):
+                result_dir, primary_srt = result
+            else:
+                result_dir, primary_srt = result, ""
             if result_dir:
                 self._last_output_dir = result_dir
                 self._open_folder_btn.configure(state="normal")
-                self.app.after(0, lambda: self._handoff_to_burn(video, result_dir))
+                self.app.after(
+                    0, lambda: self._handoff_to_burn(video, result_dir, primary_srt))
             self.btn.configure(state="normal", text="▶  开始")
             self.stop_btn.configure(state="disabled", text="⏹  停止")
 
@@ -814,15 +928,16 @@ class TranscribeTab(Tab):
             self._stop_event.set()
         self.stop_btn.configure(state="disabled", text="停止中...")
 
-    def _handoff_to_burn(self, video_path: str, result_dir: str):
+    def _handoff_to_burn(self, video_path: str, result_dir: str, primary_srt: str = ""):
         """Switch to BurnTab and fill in video + SRT paths after transcription."""
-        # Find the best SRT: bilingual > chinese > english, newest first
-        srt_found = ""
-        for pattern in ("双语_*.srt", "部分双语_*.srt", "中文_*.srt", "部分中文_*.srt", "英文_*.srt"):
-            matches = _glob.glob(os.path.join(result_dir, pattern))
-            if matches:
-                srt_found = max(matches, key=os.path.getmtime)
-                break
+        # 优先用 run_transcribe 返回的实际保存路径；为空再按目录扫描兜底。
+        srt_found = primary_srt if (primary_srt and os.path.exists(primary_srt)) else ""
+        if not srt_found:
+            for pattern in ("双语_*.srt", "部分双语_*.srt", "中文_*.srt", "部分中文_*.srt", "英文_*.srt"):
+                matches = _glob.glob(os.path.join(result_dir, pattern))
+                if matches:
+                    srt_found = max(matches, key=os.path.getmtime)
+                    break
 
         # 用现有 SRT 翻译时没有选视频（video_path 为空）：
         # 自动取字幕所在目录中最早的视频作为默认视频地址。
@@ -832,8 +947,12 @@ class TranscribeTab(Tab):
             if video_path:
                 self._log(f"🎬 已自动选用目录中最早的视频: {os.path.basename(video_path)}")
 
+        self._log(f"↪ 跳转烧录：字幕={os.path.basename(srt_found) if srt_found else '(未找到)'}，"
+                  f"视频={os.path.basename(video_path) if video_path else '(无)'}")
+
         burn_tab = getattr(self.app, "burn_tab", None)
         if burn_tab is None:
+            self._log("⚠ 未找到烧录页，跳过自动填充")
             return
         burn_tab.set_files(video_path, srt_found)
         # Switch notebook to the burn tab (index 2)
